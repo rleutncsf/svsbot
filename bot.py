@@ -31,6 +31,115 @@ COLORS = {
     "neutral": 0xB0B0B0
 }
 
+HELP_SECTIONS = {
+    "general": {
+        "title": "📋 General & Registration",
+        "commands": [
+            ("/register", "name birthday_yyyy_mm_dd gender pronouns faceclaim main_skill nationality form_link [ethnicity] [profile_picture]", "Register a new Trainee OC. Each user may have up to the configured OC cap."),
+            ("/profile", "oc_name", "View a Trainee's full profile card."),
+            ("/oc_all", "", "Browse all currently active Trainees (paginated)."),
+            ("/oc_eliminated", "", "View all eliminated Trainees."),
+            ("/removeoc", "oc_name", "Permanently archive one of your own Trainees."),
+        ],
+        "dev_commands": []
+    },
+    "voting": {
+        "title": "🗳️ Voting",
+        "commands": [
+            ("/vote", "oc_names", "Vote for one or more Trainees (comma-separated). Subject to the per-round vote cap."),
+            ("/votingstatus", "", "Check whether voting is currently open and see the current tally (if permitted)."),
+        ],
+        "dev_commands": [
+            ("/votingopen", "", "🔒 Open a new voting round and clear the previous vote ledger."),
+            ("/votingclose", "", "🔒 Close voting, apply the multiplier, tally votes, update rankings, and post to the announcement channel."),
+            ("/config votingmultiplier", "value", "🔒 Set the vote-to-points multiplier."),
+            ("/config votingcap", "cap", "🔒 Set the maximum number of votes per user per round (0 = unlimited)."),
+        ]
+    },
+    "points": {
+        "title": "🏆 Points & Rankings",
+        "commands": [
+            ("/rankings", "", "View the current live leaderboard (paginated)."),
+            ("/reveal", "", "Trigger a sequential cinematic ranking reveal in the announcement channel."),
+        ],
+        "dev_commands": [
+            ("/points", "oc_name action value", "🔒 Add, Deduct, Multiply, or Set a Trainee's mission points."),
+            ("/resetallpoints", "", "🔒 Zero all OC points and anchor a new ranking baseline snapshot. Requires voting to be closed first."),
+            ("/export_rankings", "", "🔒 Export full state (rankings, history, logs, feeds) as a TSV file."),
+        ]
+    },
+    "dorms": {
+        "title": "🏠 Dorms",
+        "commands": [
+            ("/dorm_view", "", "View all dorm floor and room assignments."),
+        ],
+        "dev_commands": [
+            ("/dorm_createfloor", "floor_name", "🔒 Create a new dorm floor. Automatically creates a matching Discord category."),
+            ("/dorm_createroom", "floor_name room_name capacity", "🔒 Create a room under a floor. Automatically creates a text channel inside the floor's category."),
+            ("/dorm_assign", "oc_name floor_name room_name", "🔒 Manually assign an OC to a room."),
+        ]
+    },
+    "grades": {
+        "title": "🎓 Grades",
+        "commands": [],
+        "dev_commands": [
+            ("/grade_create", "label hex_color", "🔒 Create a new grade tier with a display colour (#RRGGBB)."),
+            ("/assigngrade", "oc_name grade_label", "🔒 Assign a grade tier to an OC."),
+        ]
+    },
+    "missions": {
+        "title": "🎯 Mission Groups",
+        "commands": [
+            ("/missiongroup view", "[group_name]", "View all active mission groups or details of a single group."),
+        ],
+        "dev_commands": [
+            ("/missiongroup create", "name oc_names", "🔒 Create a new mission group (comma-separated OC names)."),
+            ("/missiongroup addmember", "group_name oc_name", "🔒 Add a Trainee to an existing group."),
+            ("/missiongroup removemember", "group_name oc_name", "🔒 Remove a Trainee from a group."),
+            ("/missiongroup provision", "group_name [category]", "🔒 Create a Discord practice channel for the group."),
+            ("/missiongroup deprovision", "group_name", "🔒 Delete the group's practice channel."),
+            ("/missiongroup archive", "group_name", "🔒 Archive a mission group."),
+        ]
+    },
+    "peerranking": {
+        "title": "⚖️ Peer Ranking",
+        "commands": [
+            ("/peerranking vote", "session_id ranking", "Submit your ballot for an open peer ranking session. Ranking is a comma-separated list of OC names from best to worst performer."),
+            ("/peerranking mystatus", "", "Check whether you have submitted a ballot in the current session."),
+        ],
+        "dev_commands": [
+            ("/peerranking toggle", "enabled", "🔒 Enable or disable the peer ranking system globally."),
+            ("/peerranking configure", "benefit_type benefit_value penalty_type penalty_value [transparent]", "🔒 Set reward/penalty parameters."),
+            ("/peerranking opensession", "mission_group", "🔒 Open a new peer ranking session for a group."),
+            ("/peerranking closesession", "", "🔒 Close the active session and lock in ballots."),
+            ("/peerranking resolve", "", "🔒 Tally ballots, apply benefit/penalty, update points."),
+            ("/peerranking reveal", "", "🔒 Post the peer ranking results to the announcement channel."),
+        ]
+    },
+    "feeds": {
+        "title": "📸 OC Feed",
+        "commands": [
+            ("/feed post", "oc_name caption [media_url_1..5]", "Post to your OC's public feed. Supports up to 5 media URLs."),
+            ("/feed view", "oc_name", "Browse an OC's feed posts (paginated)."),
+        ],
+        "dev_commands": [
+            ("/feed delete", "oc_name post_number", "🔒 Delete a specific feed post (owners may also delete their own)."),
+        ]
+    },
+    "config": {
+        "title": "⚙️ Configuration",
+        "commands": [],
+        "dev_commands": [
+            ("/setup", "timezone announce_channel dev_role [asset_channel]", "🔒 Initial bot setup."),
+            ("/config_view", "", "🔒 View all current configuration values."),
+            ("/setassetchannel", "channel", "🔒 Set the persistent asset storage channel."),
+            ("/setfeedchannel", "channel", "🔒 Set the public feed channel."),
+            ("/setrevealpage", "size", "🔒 Set how many Trainees appear per reveal page (1–25)."),
+            ("/config setdebutslots", "slots [public]", "🔒 Mark the top N ranking positions as the debut line."),
+        ]
+    },
+}
+
 DEFAULT_SCHEMA = {
     "config": {
         "timezone": "UTC",
@@ -140,6 +249,16 @@ def load_data():
                 if "feed_post_ids" not in oc:
                     oc["feed_post_ids"] = []
                     modified = True
+
+            # Schema Migration Guard for Dorms: add category_id and room channel_id
+            for floor_name, floor_data in data.get("dorms", {}).items():
+                if "category_id" not in floor_data:
+                    floor_data["category_id"] = None
+                    modified = True
+                for room_name, room_data in floor_data.get("rooms", {}).items():
+                    if "channel_id" not in room_data:
+                        room_data["channel_id"] = None
+                        modified = True
 
             if modified:
                 save_data(data)
@@ -559,7 +678,14 @@ async def _run_sequential_reveal(channel: discord.TextChannel, ocs_ordered: list
 # ==========================================
 class SurvivalBot(commands.Bot):
     def __init__(self):
-        super().__init__(command_prefix="!", intents=discord.Intents.all())
+        intents = discord.Intents.default()
+        # Enable only the privileged intents you actually read.
+        # members: required if you call guild.get_member(), guild.members, or
+        #          use Member objects in interactions beyond interaction.user.
+        # message_content: NOT needed — no on_message / prefix command logic is live.
+        # presences: NOT needed — no status/activity reads anywhere.
+        intents.members = True   # Enable ONLY this privileged intent.
+        super().__init__(command_prefix="!", intents=intents)
 
     async def setup_hook(self):
         await self.add_cog(ConfigCog(self))
@@ -572,6 +698,7 @@ class SurvivalBot(commands.Bot):
         await self.add_cog(MissionGroupCog(self))
         await self.add_cog(PeerRankingCog(self))
         await self.add_cog(ExportCog(self))
+        await self.add_cog(HelpCog(self))
         await self.add_cog(FeedCog(self))
 
         # Re-register all live feed post views for persistence across restarts
@@ -943,35 +1070,116 @@ class VotingCog(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
 
-    @app_commands.command(name="vote", description="Cast a vote for a Trainee")
-    async def vote(self, interaction: discord.Interaction, oc_name: str):
+    @app_commands.command(name="vote", description="Cast vote(s) for one or more Trainees (comma-separated names)")
+    @app_commands.describe(oc_names="One or more Trainee names separated by commas, e.g. 'Mira, Juno, Haeun'")
+    async def vote(self, interaction: discord.Interaction, oc_names: str):
         data = load_data()
+
+        # Guard: voting must be open
         if not data["voting"]["is_open"]:
-            return await interaction.response.send_message(embed=get_embed("Voting Closed", "🚫 Voting is currently closed. Stay tuned for the next evaluation period.", "error"), ephemeral=True)
-        
-        oc = find_oc(oc_name, data)
-        if not oc:
-            return await interaction.response.send_message(embed=get_embed("Not Found", "Trainee not found.", "error"), ephemeral=True)
-            
-        if oc.get("eliminated", False):
             return await interaction.response.send_message(
-                embed=get_embed("Ineligible", f"**{oc['name']}** has been eliminated from the show and cannot receive votes.", "error"),
+                embed=get_embed(
+                    "Voting Closed",
+                    "🚫 Voting is currently closed. Stay tuned for the next evaluation period.",
+                    "error"
+                ),
                 ephemeral=True
             )
-            
-        user_id = str(interaction.user.id)
-        cap = data["voting"]["cap"]
-        
-        user_votes = sum(1 for v_list in data["voting"]["votes"].values() for v in v_list if v == user_id)
-        if cap > 0 and user_votes >= cap:
-            return await interaction.response.send_message(embed=get_embed("Cap Reached", "You have reached your voting limit for this round.", "error"), ephemeral=True)
-        
-        if oc["id"] not in data["voting"]["votes"]:
-            data["voting"]["votes"][oc["id"]] = []
-        data["voting"]["votes"][oc["id"]].append(user_id)
-        save_data(data)
-        
-        await interaction.response.send_message(embed=get_embed("Vote Cast", f"Your vote for **{oc['name']}** has been recorded successfully.", "success"), ephemeral=True)
+
+        user_id   = str(interaction.user.id)
+        cap       = data["voting"]["cap"]           # 0 = unlimited
+
+        # Count how many votes this user has already cast this round
+        votes_already_cast = sum(
+            v_list.count(user_id)
+            for v_list in data["voting"]["votes"].values()
+        )
+
+        # Remaining quota (None = unlimited)
+        remaining = (cap - votes_already_cast) if cap > 0 else None
+
+        # If cap is set and already exhausted, short-circuit immediately
+        if remaining is not None and remaining <= 0:
+            return await interaction.response.send_message(
+                embed=get_embed(
+                    "Cap Reached",
+                    f"You have already used all **{cap}** vote(s) for this round.",
+                    "error"
+                ),
+                ephemeral=True
+            )
+
+        # Parse the input into individual name tokens
+        raw_names = [n.strip() for n in oc_names.split(",") if n.strip()]
+
+        if not raw_names:
+            return await interaction.response.send_message(
+                embed=get_embed("No Input", "Please provide at least one Trainee name.", "error"),
+                ephemeral=True
+            )
+
+        accepted  = []   # list of OC name strings that were successfully voted for
+        rejected  = []   # list of (name_token, reason_string) tuples
+
+        for token in raw_names:
+            # Check remaining quota before processing each token
+            if remaining is not None and remaining <= 0:
+                rejected.append((token, f"Vote cap of **{cap}** reached mid-batch"))
+                continue
+
+            # OC resolution
+            oc = find_oc(token, data)
+            if not oc:
+                rejected.append((token, "Trainee not found"))
+                continue
+
+            # Eligibility check
+            if oc.get("eliminated", False):
+                rejected.append((token, f"**{oc['name']}** has been eliminated"))
+                continue
+
+            # Record the vote
+            if oc["id"] not in data["voting"]["votes"]:
+                data["voting"]["votes"][oc["id"]] = []
+            data["voting"]["votes"][oc["id"]].append(user_id)
+
+            accepted.append(oc["name"])
+            if remaining is not None:
+                remaining -= 1
+
+        # Persist only if at least one vote was accepted
+        if accepted:
+            save_data(data)
+
+        # Build response embed
+        votes_now_cast = votes_already_cast + len(accepted)
+        quota_line = (
+            f"**Quota**: {votes_now_cast}/{cap} vote(s) used this round."
+            if cap > 0 else
+            f"**Votes cast this round** (no cap): {votes_now_cast}"
+        )
+
+        if accepted and not rejected:
+            color = "success"
+            title = "✅ Vote(s) Recorded"
+        elif accepted and rejected:
+            color = "warning"
+            title = "⚠️ Partial Vote(s) Recorded"
+        else:
+            color = "error"
+            title = "❌ No Votes Recorded"
+
+        desc_parts = []
+        if accepted:
+            desc_parts.append("**Accepted**:\n" + "\n".join(f"• {n}" for n in accepted))
+        if rejected:
+            desc_parts.append("**Rejected**:\n" + "\n".join(f"• `{n}` — {reason}" for n, reason in rejected))
+        desc_parts.append(quota_line)
+
+        await interaction.response.send_message(
+            embed=get_embed(title, "\n\n".join(desc_parts), color),
+            ephemeral=True
+        )
 
     @app_commands.command(name="votingopen", description="Open a voting round immediately (Dev only)")
     @is_dev()
@@ -1165,25 +1373,134 @@ class DormsCog(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
 
-    @app_commands.command(name="dorm_createfloor", description="Create a dorm floor (Dev only)")
+    @app_commands.command(name="dorm_createfloor", description="Create a dorm floor and its Discord category (Dev only)")
     @is_dev()
     async def createfloor(self, interaction: discord.Interaction, floor_name: str):
+        await interaction.response.defer(ephemeral=True)
         data = load_data()
-        if floor_name in data["dorms"]:
-            return await interaction.response.send_message("Floor already exists.", ephemeral=True)
-        data["dorms"][floor_name] = {"rooms": {}}
-        save_data(data)
-        await interaction.response.send_message(embed=get_embed("Success", f"Floor '{floor_name}' created.", "success"), ephemeral=True)
 
-    @app_commands.command(name="dorm_createroom", description="Create a room on a floor (Dev only)")
-    @is_dev()
-    async def createroom(self, interaction: discord.Interaction, floor_name: str, room_name: str, capacity: int):
-        data = load_data()
-        if floor_name not in data["dorms"]:
-            return await interaction.response.send_message("Floor not found.", ephemeral=True)
-        data["dorms"][floor_name]["rooms"][room_name] = {"capacity": capacity, "occupants": []}
+        if floor_name in data["dorms"]:
+            return await interaction.followup.send(
+                embed=get_embed("Already Exists", f"Floor **{floor_name}** already exists.", "warning")
+            )
+
+        if not interaction.guild:
+            return await interaction.followup.send(
+                embed=get_embed("Error", "This command must be used inside a server.", "error")
+            )
+
+        # Create the Discord category
+        try:
+            category = await interaction.guild.create_category(name=floor_name)
+        except discord.Forbidden:
+            return await interaction.followup.send(
+                embed=get_embed("Permission Error", "Bot lacks `Manage Channels` permission.", "error")
+            )
+        except discord.HTTPException as e:
+            return await interaction.followup.send(
+                embed=get_embed("Discord Error", f"Category creation failed: `{e}`", "error")
+            )
+
+        # Persist the record with the new category_id field
+        data["dorms"][floor_name] = {
+            "rooms": {},
+            "category_id": category.id   # NEW FIELD
+        }
         save_data(data)
-        await interaction.response.send_message(embed=get_embed("Success", f"Room '{room_name}' created on '{floor_name}'.", "success"), ephemeral=True)
+
+        await interaction.followup.send(
+            embed=get_embed(
+                "Floor Created",
+                f"Floor **{floor_name}** has been set up.\n"
+                f"Discord category: **{category.name}** (`{category.id}`)\n"
+                f"Rooms added via `/dorm_createroom` will auto-populate under this category.",
+                "success"
+            )
+        )
+
+    @app_commands.command(name="dorm_createroom", description="Create a room on a floor and its Discord channel (Dev only)")
+    @is_dev()
+    async def createroom(
+        self,
+        interaction: discord.Interaction,
+        floor_name: str,
+        room_name: str,
+        capacity: int
+    ):
+        await interaction.response.defer(ephemeral=True)
+        data = load_data()
+
+        if floor_name not in data["dorms"]:
+            return await interaction.followup.send(
+                embed=get_embed("Not Found", f"Floor **{floor_name}** does not exist. Create it first with `/dorm_createfloor`.", "error")
+            )
+
+        if room_name in data["dorms"][floor_name]["rooms"]:
+            return await interaction.followup.send(
+                embed=get_embed("Already Exists", f"Room **{room_name}** already exists on floor **{floor_name}**.", "warning")
+            )
+
+        if capacity < 1:
+            return await interaction.followup.send(
+                embed=get_embed("Invalid Capacity", "Capacity must be at least 1.", "error")
+            )
+
+        if not interaction.guild:
+            return await interaction.followup.send(
+                embed=get_embed("Error", "This command must be used inside a server.", "error")
+            )
+
+        # Resolve the parent category (may be None if floor was created before this patch)
+        category = None
+        category_id = data["dorms"][floor_name].get("category_id")
+        if category_id:
+            category = interaction.guild.get_channel(int(category_id))
+            # If the category was manually deleted in Discord, proceed without it
+            # and log a warning in the response so the dev is aware.
+
+        # Sanitise the room name for a Discord channel slug
+        safe_name = re.sub(r'[^a-z0-9\-]', '', room_name.lower().replace(' ', '-'))[:100]
+        if not safe_name:
+            safe_name = f"room-{str(uuid.uuid4())[:8]}"
+
+        # Create the text channel, nested under the floor's category if available
+        try:
+            channel = await interaction.guild.create_text_channel(
+                name=safe_name,
+                category=category,
+                topic=f"Dorm room {room_name} on floor {floor_name}. Capacity: {capacity}."
+            )
+        except discord.Forbidden:
+            return await interaction.followup.send(
+                embed=get_embed("Permission Error", "Bot lacks `Manage Channels` permission.", "error")
+            )
+        except discord.HTTPException as e:
+            return await interaction.followup.send(
+                embed=get_embed("Discord Error", f"Channel creation failed: `{e}`", "error")
+            )
+
+        # Persist the room record, including the new channel_id field
+        data["dorms"][floor_name]["rooms"][room_name] = {
+            "capacity": capacity,
+            "occupants": [],
+            "channel_id": channel.id   # NEW FIELD
+        }
+        save_data(data)
+
+        orphan_warning = (
+            "\n⚠️ **Note**: The floor's Discord category was not found; the channel was created without a parent category."
+            if category_id and category is None else ""
+        )
+
+        await interaction.followup.send(
+            embed=get_embed(
+                "Room Created",
+                f"Room **{room_name}** on floor **{floor_name}** is ready.\n"
+                f"Discord channel: <#{channel.id}>\n"
+                f"Capacity: **{capacity}** occupant(s).{orphan_warning}",
+                "success"
+            )
+        )
 
     @app_commands.command(name="dorm_assign", description="Manually assign an OC to a room (Dev only)")
     @is_dev()
@@ -1219,15 +1536,32 @@ class DormsCog(commands.Cog):
     @app_commands.command(name="dorm_view", description="Publicly view dormitory assignments")
     async def view(self, interaction: discord.Interaction):
         data = load_data()
-        embed = get_embed("Dormitory Assignments", "Current resident listings by floor.")
+        if not data["dorms"]:
+            return await interaction.response.send_message(
+                embed=get_embed("No Dorms", "No dorm floors have been created yet.", "system")
+            )
+
+        embed = get_embed("🏠 Dormitory Assignments", "Current resident listings by floor.")
         for floor, f_data in data["dorms"].items():
+            cat_id = f_data.get("category_id")
+            cat_mention = f" *(Category `{cat_id}`)*" if cat_id else ""
             desc = ""
             for r_name, r_data in f_data["rooms"].items():
-                occ_names = [data["ocs"][oid]["name"] for oid in r_data["occupants"] if oid in data["ocs"] and not data["ocs"][oid].get("eliminated", False)]
-                names_str = ", ".join(occ_names) if occ_names else "*Empty*"
-                desc += f"**Room {r_name}** ({len(occ_names)}/{r_data['capacity']}): {names_str}\n"
-            if desc:
-                embed.add_field(name=f"Floor: {floor}", value=desc, inline=False)
+                occ_names = [
+                    data["ocs"][oid]["name"]
+                    for oid in r_data["occupants"]
+                    if oid in data["ocs"] and not data["ocs"][oid].get("eliminated", False)
+                ]
+                names_str  = ", ".join(occ_names) if occ_names else "*Empty*"
+                ch_mention = f" · <#{r_data['channel_id']}>" if r_data.get("channel_id") else ""
+                desc += (
+                    f"**Room {r_name}**{ch_mention} "
+                    f"({len(occ_names)}/{r_data['capacity']}): {names_str}\n"
+                )
+            if not desc:
+                desc = "*No rooms yet.*"
+            embed.add_field(name=f"Floor: {floor}{cat_mention}", value=desc, inline=False)
+
         await interaction.response.send_message(embed=embed)
 
 class MissionGroupCog(commands.Cog):
@@ -1777,6 +2111,142 @@ class RankingsCog(commands.Cog):
             view=RankingPaginationView(page_embeds)
         )
 
+class ExportCog(commands.Cog):
+    def __init__(self, bot):
+        self.bot = bot
+
+    @app_commands.command(name="export_rankings", description="Export full state to TSV (Dev only)")
+    @is_dev()
+    async def export_rankings(self, interaction: discord.Interaction):
+        data = load_data()
+        output = io.StringIO()
+        writer = csv.writer(output, delimiter='\t')
+        
+        writer.writerow(["--- SECTION 1: CURRENT RANKINGS ---"])
+        writer.writerow(["rank", "oc_name", "owner_discord_id", "owner_username", "grade", "total_points", "voting_points", "mission_points", "rank_change", "dorm_floor", "dorm_room", "registered_at", "eliminated", "profile_picture_url"])
+        
+        ocs = sorted(list(data["ocs"].values()), key=lambda x: (x.get("eliminated", False), x.get("current_rank", 999999)))
+        for oc in ocs:
+            change = get_rank_change(oc["id"], oc.get("current_rank", 0), data)
+            writer.writerow([
+                oc.get("current_rank", ""), oc["name"], oc["owner_id"], oc["owner_name"], 
+                oc.get("grade",""), oc["total_points"], oc["voting_points"], oc["mission_points"], 
+                change, oc.get("dorm_floor",""), oc.get("dorm_room",""), oc["registered_at"], 
+                str(oc.get("eliminated", False)), oc.get("profile_picture_url", "")
+            ])
+        
+        writer.writerow([])
+        writer.writerow(["--- SECTION 2: RANK HISTORY ---"])
+        writer.writerow(["oc_name", "snapshot_timestamp", "snapshot_trigger", "rank_at_snapshot", "points_at_snapshot"])
+        for snap in data["rank_snapshots"]:
+            for r in snap["rankings"]:
+                oc_name = data["ocs"].get(r["oc_id"], {}).get("name", "Unknown/Archived")
+                writer.writerow([oc_name, snap["timestamp"], snap["trigger"], r["rank"], r["points"]])
+                
+        writer.writerow([])
+        writer.writerow(["--- SECTION 3: POINT MANIPULATION LOG ---"])
+        writer.writerow(["timestamp", "dev_discord_id", "dev_username", "oc_name", "action", "value", "points_before", "points_after"])
+        for log in data["point_log"]:
+            writer.writerow([log["timestamp"], log["dev_id"], log["dev_name"], log["oc_name"], log["action"], log["value"], log["points_before"], log["points_after"]])
+
+        writer.writerow([])
+        writer.writerow(["--- SECTION 4: MISSION GROUPS ---"])
+        writer.writerow(["group_name", "group_id", "member_oc_names", "channel_id", "archived", "created_at"])
+        for g in data.get("mission_groups", {}).values():
+            member_names = ", ".join([data["ocs"].get(mid, {}).get("name", "Unknown") for mid in g["members"]])
+            writer.writerow([g["name"], g["group_id"], member_names, g.get("channel_id") or "", str(g.get("archived", False)), g["created_at"]])
+
+        writer.writerow([])
+        writer.writerow(["--- SECTION 5: PEER RANKING SESSIONS ---"])
+        writer.writerow(["session_id", "mission_group_name", "resolved", "revealed", "closed_at", "ballots_submitted", "eligible_voters", "benefit_oc", "penalty_oc"])
+        for s in data.get("peer_ranking_sessions", {}).values():
+            group = data.get("mission_groups", {}).get(s["mission_group_id"], {})
+            benefit_name = data["ocs"].get(s.get("benefit_applied_to", ""), {}).get("name", "N/A")
+            penalty_name = data["ocs"].get(s.get("penalty_applied_to", ""), {}).get("name", "N/A")
+            writer.writerow([
+                s["session_id"], group.get("name", "Unknown"), str(s["resolved"]),
+                str(s["revealed"]), s.get("closed_at") or "",
+                len(s["ballots"]), len(s["eligible_voter_ids"]),
+                benefit_name, penalty_name
+            ])
+
+        writer.writerow([])
+        writer.writerow(["--- SECTION 6: FEED POST ANALYTICS ---"])
+        writer.writerow(["oc_name", "post_number", "post_id", "author", "like_count", "comment_thread_id", "media_count", "created_at"])
+        for oc_id, posts in data.get("feeds", {}).items():
+            oc_name = data["ocs"].get(oc_id, data["archived_ocs"].get(oc_id, {"name": "Unknown"}))["name"]
+            for idx, post in enumerate(posts, start=1):
+                writer.writerow([
+                    oc_name, idx, post["post_id"], post["author_name"],
+                    post["like_count"], post.get("thread_id") or "",
+                    len(post["media_urls"]), post["created_at"]
+                ])
+
+        output.seek(0)
+        file = discord.File(fp=io.BytesIO(output.getvalue().encode('utf-8')), filename=f"rankings_export_{now().strftime('%Y-%m-%d_%H-%M')}.tsv")
+        await interaction.response.send_message("Here is the requested data export.", file=file, ephemeral=True)
+
+class HelpCog(commands.Cog):
+    def __init__(self, bot):
+        self.bot = bot
+
+    @app_commands.command(name="help", description="Display a guide to all bot commands")
+    @app_commands.describe(section="Jump to a specific topic (optional)")
+    @app_commands.choices(section=[
+        app_commands.Choice(name="General & Registration", value="general"),
+        app_commands.Choice(name="Voting",                 value="voting"),
+        app_commands.Choice(name="Points & Rankings",      value="points"),
+        app_commands.Choice(name="Dorms",                  value="dorms"),
+        app_commands.Choice(name="Grades",                 value="grades"),
+        app_commands.Choice(name="Mission Groups",         value="missions"),
+        app_commands.Choice(name="Peer Ranking",           value="peerranking"),
+        app_commands.Choice(name="OC Feed",                value="feeds"),
+        app_commands.Choice(name="Configuration",          value="config"),
+    ])
+    async def help_cmd(self, interaction: discord.Interaction, section: app_commands.Choice[str] = None):
+        if section is None:
+            # Build the index overview page
+            embed = get_embed(
+                "📖 Survival Show Sim — Command Guide",
+                "Use `/help section:<name>` to drill into any topic.\n\u200b",
+                "system"
+            )
+            for key, sec in HELP_SECTIONS.items():
+                public_count = len(sec["commands"])
+                dev_count    = len(sec["dev_commands"])
+                embed.add_field(
+                    name=sec["title"],
+                    value=(
+                        f"{public_count} public command(s)"
+                        + (f" · {dev_count} staff command(s) 🔒" if dev_count else "")
+                        + f"\n`/help section:{key}`"
+                    ),
+                    inline=True
+                )
+            embed.set_footer(text="🔒 = Dev/Staff only  ·  Survival Show Sim")
+            return await interaction.response.send_message(embed=embed, ephemeral=True)
+
+        # Specific section page
+        sec = HELP_SECTIONS[section.value]
+        embed = get_embed(sec["title"], "", "system")
+
+        all_entries = [(cmd, params, desc, False) for cmd, params, desc in sec["commands"]] + \
+                      [(cmd, params, desc, True)  for cmd, params, desc in sec["dev_commands"]]
+
+        if not all_entries:
+            embed.description = "*No commands in this section.*"
+        else:
+            for cmd, params, desc, is_dev_cmd in all_entries:
+                usage = f"`{cmd}`" + (f" `{params}`" if params else "")
+                embed.add_field(
+                    name=usage,
+                    value=desc,
+                    inline=False
+                )
+
+        embed.set_footer(text="🔒 = Dev/Staff only  ·  Survival Show Sim")
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
 class FeedCog(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
@@ -1985,81 +2455,6 @@ class FeedCog(commands.Cog):
         save_data(data)
         
         await interaction.response.send_message(embed=get_embed("Post Deleted", f"Post #{post_number} from **{oc['name']}**'s feed has been removed.", "success"), ephemeral=True)
-
-class ExportCog(commands.Cog):
-    def __init__(self, bot):
-        self.bot = bot
-
-    @app_commands.command(name="export_rankings", description="Export full state to TSV (Dev only)")
-    @is_dev()
-    async def export_rankings(self, interaction: discord.Interaction):
-        data = load_data()
-        output = io.StringIO()
-        writer = csv.writer(output, delimiter='\t')
-        
-        writer.writerow(["--- SECTION 1: CURRENT RANKINGS ---"])
-        writer.writerow(["rank", "oc_name", "owner_discord_id", "owner_username", "grade", "total_points", "voting_points", "mission_points", "rank_change", "dorm_floor", "dorm_room", "registered_at", "eliminated", "profile_picture_url"])
-        
-        ocs = sorted(list(data["ocs"].values()), key=lambda x: (x.get("eliminated", False), x.get("current_rank", 999999)))
-        for oc in ocs:
-            change = get_rank_change(oc["id"], oc.get("current_rank", 0), data)
-            writer.writerow([
-                oc.get("current_rank", ""), oc["name"], oc["owner_id"], oc["owner_name"], 
-                oc.get("grade",""), oc["total_points"], oc["voting_points"], oc["mission_points"], 
-                change, oc.get("dorm_floor",""), oc.get("dorm_room",""), oc["registered_at"], 
-                str(oc.get("eliminated", False)), oc.get("profile_picture_url", "")
-            ])
-        
-        writer.writerow([])
-        writer.writerow(["--- SECTION 2: RANK HISTORY ---"])
-        writer.writerow(["oc_name", "snapshot_timestamp", "snapshot_trigger", "rank_at_snapshot", "points_at_snapshot"])
-        for snap in data["rank_snapshots"]:
-            for r in snap["rankings"]:
-                oc_name = data["ocs"].get(r["oc_id"], {}).get("name", "Unknown/Archived")
-                writer.writerow([oc_name, snap["timestamp"], snap["trigger"], r["rank"], r["points"]])
-                
-        writer.writerow([])
-        writer.writerow(["--- SECTION 3: POINT MANIPULATION LOG ---"])
-        writer.writerow(["timestamp", "dev_discord_id", "dev_username", "oc_name", "action", "value", "points_before", "points_after"])
-        for log in data["point_log"]:
-            writer.writerow([log["timestamp"], log["dev_id"], log["dev_name"], log["oc_name"], log["action"], log["value"], log["points_before"], log["points_after"]])
-
-        writer.writerow([])
-        writer.writerow(["--- SECTION 4: MISSION GROUPS ---"])
-        writer.writerow(["group_name", "group_id", "member_oc_names", "channel_id", "archived", "created_at"])
-        for g in data.get("mission_groups", {}).values():
-            member_names = ", ".join([data["ocs"].get(mid, {}).get("name", "Unknown") for mid in g["members"]])
-            writer.writerow([g["name"], g["group_id"], member_names, g.get("channel_id") or "", str(g.get("archived", False)), g["created_at"]])
-
-        writer.writerow([])
-        writer.writerow(["--- SECTION 5: PEER RANKING SESSIONS ---"])
-        writer.writerow(["session_id", "mission_group_name", "resolved", "revealed", "closed_at", "ballots_submitted", "eligible_voters", "benefit_oc", "penalty_oc"])
-        for s in data.get("peer_ranking_sessions", {}).values():
-            group = data.get("mission_groups", {}).get(s["mission_group_id"], {})
-            benefit_name = data["ocs"].get(s.get("benefit_applied_to", ""), {}).get("name", "N/A")
-            penalty_name = data["ocs"].get(s.get("penalty_applied_to", ""), {}).get("name", "N/A")
-            writer.writerow([
-                s["session_id"], group.get("name", "Unknown"), str(s["resolved"]),
-                str(s["revealed"]), s.get("closed_at") or "",
-                len(s["ballots"]), len(s["eligible_voter_ids"]),
-                benefit_name, penalty_name
-            ])
-
-        writer.writerow([])
-        writer.writerow(["--- SECTION 6: FEED POST ANALYTICS ---"])
-        writer.writerow(["oc_name", "post_number", "post_id", "author", "like_count", "comment_thread_id", "media_count", "created_at"])
-        for oc_id, posts in data.get("feeds", {}).items():
-            oc_name = data["ocs"].get(oc_id, data["archived_ocs"].get(oc_id, {"name": "Unknown"}))["name"]
-            for idx, post in enumerate(posts, start=1):
-                writer.writerow([
-                    oc_name, idx, post["post_id"], post["author_name"],
-                    post["like_count"], post.get("thread_id") or "",
-                    len(post["media_urls"]), post["created_at"]
-                ])
-
-        output.seek(0)
-        file = discord.File(fp=io.BytesIO(output.getvalue().encode('utf-8')), filename=f"rankings_export_{now().strftime('%Y-%m-%d_%H-%M')}.tsv")
-        await interaction.response.send_message("Here is the requested data export.", file=file, ephemeral=True)
 
 # ==========================================
 # 6. BACKGROUND TASKS
