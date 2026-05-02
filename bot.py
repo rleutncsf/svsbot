@@ -11,6 +11,8 @@ import re
 import csv
 import io
 import random
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
 # --- SYSTEM CONSTANTS & COLORS ---
 FILE_NAME = "database.json"
@@ -1489,6 +1491,20 @@ async def export_data(interaction: discord.Interaction):
     output.seek(0)
     file = discord.File(fp=io.BytesIO(output.getvalue().encode('utf-8')), filename=f"rankings_export_{get_now().strftime('%Y-%m-%d_%H-%M')}.tsv")
     await interaction.response.send_message(file=file, ephemeral=True)
+
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"OK")
+
+    def log_message(self, format, *args):
+        pass  # Suppress access logs
+
+def run_health_server():
+    port = int(os.getenv("PORT", 8080))
+    server = HTTPServer(("0.0.0.0", port), HealthHandler)
+    server.serve_forever()
 
 # Run the bot
 if __name__ == "__main__":
