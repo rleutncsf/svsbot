@@ -4,7 +4,7 @@ from discord import app_commands
 import json
 import os
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timezone as _tz
 import zoneinfo
 import uuid
 import re
@@ -65,6 +65,11 @@ DEFAULT_DB = {
     "point_log": []
 }
 
+# --- HELPERS ---
+def _migration_timestamp():
+    """Safe timestamp for use inside load_db() before db is assigned."""
+    return datetime.now(_tz.utc).isoformat()
+
 # --- DATABASE MANAGEMENT ---
 def load_db():
     if not os.path.exists(FILE_NAME):
@@ -88,13 +93,13 @@ def load_db():
             if "last_closed_at" not in data["voting"]: data["voting"]["last_closed_at"] = None
             if "user_votes" not in data["voting"]: data["voting"]["user_votes"] = {}
             
-            # Dorm room schema migration: add "created_at" and "label" if missing
+            # Dorm room schema migration
             for floor_label, floor_data in data.get("dorms", {}).items():
                 if "label" not in floor_data: floor_data["label"] = floor_label
-                if "created_at" not in floor_data: floor_data["created_at"] = get_now().isoformat()
+                if "created_at" not in floor_data: floor_data["created_at"] = _migration_timestamp()
                 for room_label, room_data in floor_data.get("rooms", {}).items():
                     if "label" not in room_data: room_data["label"] = room_label
-                    if "created_at" not in room_data: room_data["created_at"] = get_now().isoformat()
+                    if "created_at" not in room_data: room_data["created_at"] = _migration_timestamp()
                     if "capacity" not in room_data: room_data["capacity"] = 4  # default fallback
                     if "occupants" not in room_data: room_data["occupants"] = []
 
@@ -111,6 +116,12 @@ def load_db():
                 if "feed_post_ids" not in oc: oc["feed_post_ids"] = []
                 if "dorm_floor" not in oc: oc["dorm_floor"] = None
                 if "dorm_room" not in oc: oc["dorm_room"] = None
+                
+            # Feed Post Schema Migrations
+            for feed_list in data.get("feeds", {}).values():
+                for post in feed_list:
+                    if "liked_by" not in post:
+                        post["liked_by"] = []
 
             return data
     except json.JSONDecodeError:
@@ -124,12 +135,13 @@ def save_db(data):
 
 db = load_db()
 
-# --- HELPERS ---
 def get_tz():
+    tz_str = db.get("config", {}).get("timezone", "UTC")
     try:
-        return zoneinfo.ZoneInfo(db["config"]["timezone"])
-    except:
-        return timezone.utc
+        return zoneinfo.ZoneInfo(tz_str)
+    except (zoneinfo.ZoneInfoNotFoundError, KeyError):
+        print(f"WARNING: Invalid timezone '{tz_str}' in config. Falling back to UTC.")
+        return _tz.utc
 
 def get_now():
     return datetime.now(get_tz())
@@ -156,6 +168,10 @@ def hex_to_int(hex_str):
     return int(hex_str.lstrip('#'), 16) if hex_str else COLOR_UNGRADED
 
 def recalculate_ranks():
+    for oc in db["ocs"].values():
+        if oc.get("eliminated", False):
+            oc["rank"] = None
+
     active_ocs = [oc for oc in db["ocs"].values() if not oc.get("eliminated", False)]
     if not active_ocs:
         save_db(db)
@@ -170,6 +186,8 @@ def get_snapshot_diff(oc_id, current_rank):
     # NOTE: The baseline snapshot is always db["rank_snapshots"][-1].
     # After /resetallpoints runs, this becomes the post-reset baseline,
     # so all diff arrows reflect movement since the last reset.
+    if current_rank is None:
+        return "✗"
     if not db["rank_snapshots"]: return "🆕"
     last_snap = db["rank_snapshots"][-1]["rankings"]
     if oc_id not in last_snap: return "🆕"
@@ -258,15 +276,12 @@ class ConfirmResetView(discord.ui.View):
         super().__init__(timeout=30)
         self.message: discord.Message = None
 
-    async def _disable_all(self):
+    def _disable_all(self):
         for item in self.children: item.disabled = True
-        if self.message:
-            try: await self.message.edit(view=self)
-            except discord.NotFound: pass
 
     @discord.ui.button(label="✅ Confirm", style=discord.ButtonStyle.danger)
     async def confirm_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self._disable_all()
+        self._disable_all()
         active_ocs = [oc for oc in db["ocs"].values() if not oc.get("eliminated", False)]
 
         if not active_ocs:
@@ -314,11 +329,15 @@ class ConfirmResetView(discord.ui.View):
 
     @discord.ui.button(label="✖ Cancel", style=discord.ButtonStyle.secondary)
     async def cancel_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self._disable_all()
+        self._disable_all()
         await interaction.response.edit_message(embed=get_embed("Cancelled", "Point reset aborted. No changes were made.", COLOR_SYSTEM), view=self)
 
     async def on_timeout(self):
-        await self._disable_all()
+        self._disable_all()
+        if self.message:
+            try: await self.message.edit(view=self)
+            except discord.NotFound: pass
+
 
 class GradeRemoveConfirmView(discord.ui.View):
     def __init__(self, canon_label, affected_ocs):
@@ -327,15 +346,12 @@ class GradeRemoveConfirmView(discord.ui.View):
         self.affected_ocs = affected_ocs
         self.message = None
         
-    async def _disable_all(self):
+    def _disable_all(self):
         for item in self.children: item.disabled = True
-        if self.message:
-            try: await self.message.edit(view=self)
-            except: pass
 
     @discord.ui.button(label="✅ Confirm Remove", style=discord.ButtonStyle.danger)
     async def confirm_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self._disable_all()
+        self._disable_all()
         del db["grades"][self.canon_label]
         for oc in self.affected_ocs:
             oc["grade"] = None
@@ -344,11 +360,15 @@ class GradeRemoveConfirmView(discord.ui.View):
         
     @discord.ui.button(label="✖ Cancel", style=discord.ButtonStyle.secondary)
     async def cancel_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self._disable_all()
+        self._disable_all()
         await interaction.response.edit_message(embed=get_embed("Cancelled", "Grade removal aborted.", COLOR_SYSTEM), view=self)
 
     async def on_timeout(self):
-        await self._disable_all()
+        self._disable_all()
+        if self.message:
+            try: await self.message.edit(view=self)
+            except discord.NotFound: pass
+
 
 class DormFloorDeleteConfirmView(discord.ui.View):
     def __init__(self, canon_floor):
@@ -356,15 +376,12 @@ class DormFloorDeleteConfirmView(discord.ui.View):
         self.canon_floor = canon_floor
         self.message = None
         
-    async def _disable_all(self):
+    def _disable_all(self):
         for item in self.children: item.disabled = True
-        if self.message:
-            try: await self.message.edit(view=self)
-            except: pass
 
     @discord.ui.button(label="✅ Confirm Delete", style=discord.ButtonStyle.danger)
     async def confirm_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self._disable_all()
+        self._disable_all()
         floor_data = db["dorms"].get(self.canon_floor, {})
         evicted = 0
         for r_data in floor_data.get("rooms", {}).values():
@@ -381,26 +398,27 @@ class DormFloorDeleteConfirmView(discord.ui.View):
 
     @discord.ui.button(label="✖ Cancel", style=discord.ButtonStyle.secondary)
     async def cancel_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self._disable_all()
+        self._disable_all()
         await interaction.response.edit_message(embed=get_embed("Cancelled", "Floor deletion aborted.", COLOR_SYSTEM), view=self)
 
     async def on_timeout(self):
-        await self._disable_all()
+        self._disable_all()
+        if self.message:
+            try: await self.message.edit(view=self)
+            except discord.NotFound: pass
+
 
 class DormResetConfirmView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=30)
         self.message = None
         
-    async def _disable_all(self):
+    def _disable_all(self):
         for item in self.children: item.disabled = True
-        if self.message:
-            try: await self.message.edit(view=self)
-            except: pass
 
     @discord.ui.button(label="✅ Confirm Unassign", style=discord.ButtonStyle.danger)
     async def confirm_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self._disable_all()
+        self._disable_all()
         evicted = 0
         for oc in db["ocs"].values():
             if oc["dorm_floor"] or oc["dorm_room"]:
@@ -416,11 +434,15 @@ class DormResetConfirmView(discord.ui.View):
 
     @discord.ui.button(label="✖ Cancel", style=discord.ButtonStyle.secondary)
     async def cancel_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self._disable_all()
+        self._disable_all()
         await interaction.response.edit_message(embed=get_embed("Cancelled", "Reset aborted.", COLOR_SYSTEM), view=self)
 
     async def on_timeout(self):
-        await self._disable_all()
+        self._disable_all()
+        if self.message:
+            try: await self.message.edit(view=self)
+            except discord.NotFound: pass
+
 
 class DormNukeModal(discord.ui.Modal, title="Confirm Dorm Nuke"):
     confirm_text = discord.ui.TextInput(
@@ -470,19 +492,33 @@ class FeedPostView(discord.ui.View):
     @discord.ui.button(label="❤️ Like", style=discord.ButtonStyle.danger, custom_id="feed_like:placeholder")
     async def like_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         post = self._get_post()
-        if not post: return await interaction.response.send_message("Post not found.", ephemeral=True)
+        if not post:
+            return await interaction.response.send_message("Post not found.", ephemeral=True)
 
+        uid = interaction.user.id
+        liked_by = post.setdefault("liked_by", [])
+
+        if uid in liked_by:
+            return await interaction.response.send_message(
+                embed=get_embed("Already Liked", "You've already liked this post.", COLOR_WARNING),
+                ephemeral=True
+            )
+
+        liked_by.append(uid)
         post["like_count"] += 1
         save_db(db)
 
         try:
             original_embed = interaction.message.embeds[0]
             old_footer = original_embed.footer.text or ""
-            new_footer = re.sub(r"❤️ \d+ likes", f"❤️ {post['like_count']} likes", old_footer)
+            new_footer = re.sub(r"❤️ \d+ likes?", f"❤️ {post['like_count']} like{'s' if post['like_count'] != 1 else ''}", old_footer)
+            if new_footer == old_footer:
+                new_footer = old_footer + f"  ·  ❤️ {post['like_count']} likes"
             original_embed.set_footer(text=new_footer)
             await interaction.response.edit_message(embed=original_embed, view=self)
         except Exception:
             await interaction.response.defer()
+
 
     @discord.ui.button(label="💬 Comment", style=discord.ButtonStyle.secondary, custom_id="feed_comment:placeholder")
     async def comment_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -524,14 +560,9 @@ class CommentModal(discord.ui.Modal, title="Leave a Comment"):
                     if thread.archived: await thread.edit(archived=False)
             else:
                 post_msg = await feed_ch.fetch_message(post["message_id"])
-                oc_name = "Unknown OC"
-                for feed_list in db["feeds"].values():
-                    for p in feed_list:
-                        if p["post_id"] == post["post_id"]:
-                            oc = db["ocs"].get(p["oc_id"])
-                            if oc: oc_name = oc["name"]
-                            break
-
+                oc = db["ocs"].get(post.get("oc_id")) or db.get("archived_ocs", {}).get(post.get("oc_id"))
+                oc_name = oc["name"] if oc else "Unknown OC"
+                
                 thread = await post_msg.create_thread(name=f"💬 {oc_name} · Comments", auto_archive_duration=10080)
                 post["thread_id"] = thread.id
                 save_db(db)
@@ -558,14 +589,15 @@ async def _run_sequential_reveal(channel: discord.TextChannel, ocs_ordered: list
         page_embed = get_embed("Rankings Reveal", color=reveal_color)
         
         for oc in batch:
-            if not line_shown and show_debut_line and debut_slots > 0 and oc["rank"] <= debut_slots:
+            if (not line_shown and show_debut_line and debut_slots > 0 
+                    and oc.get("rank") is not None and oc["rank"] == debut_slots):
                 await channel.send(embed=get_embed("✦ THE DEBUT LINE ✦", f"*The top {debut_slots} trainees above this line will debut.*", reveal_color))
                 await asyncio.sleep(random.uniform(1.5, 2.5))
                 line_shown = True
 
-            change = get_snapshot_diff(oc["id"], oc["rank"])
+            change = get_snapshot_diff(oc["id"], oc.get("rank"))
             grade_str = f"[{oc['grade']}]" if oc["grade"] else ""
-            field_title = f"✦ Rank #{oc['rank']} {grade_str}"
+            field_title = f"✦ Rank #{oc['rank']} {grade_str}" if oc.get("rank") else f"✦ Eliminated {grade_str}"
             field_val = f"**{oc['name']}** · {oc['total_points']:,} pts\n<@{oc['owner_id']}> ({change})"
             
             single_embed = get_embed("", color=reveal_color)
@@ -593,14 +625,12 @@ async def _run_sequential_reveal(channel: discord.TextChannel, ocs_ordered: list
 oc_group = app_commands.Group(name="oc", description="OC Management commands")
 
 def build_profile_embed(oc):
-    grade_emoji = "⭐"
     if oc["grade"] and oc["grade"] in db["grades"]:
         color = hex_to_int(db["grades"][oc["grade"]])
-        grade_emoji = oc["grade"]
+        grade_emoji = "⭐"
     else:
-        # Grade was deleted or OC is ungraded
-        oc_grade_display = oc["grade"] if oc["grade"] else "Ungraded"
         color = COLOR_UNGRADED
+        grade_emoji = "⭐"
 
     embed = get_embed(f"{oc['name']} {grade_emoji}", color=color)
     if oc.get("eliminated", False):
@@ -621,7 +651,8 @@ def build_profile_embed(oc):
     embed.add_field(name="🌏 Nationality · Ethnicity", value=f"{oc['nationality']} · {oc['ethnicity']}", inline=True)
     if oc["form_link"]: embed.add_field(name="🔗 Profile", value=f"[View Full Profile]({oc['form_link']})", inline=True)
     
-    embed.add_field(name="📊 Points & Rank", value=f"{oc['total_points']:,} pts · Rank #{oc['rank']}", inline=False)
+    rank_text = "Eliminated" if oc.get("eliminated") else f"Rank #{oc['rank']}"
+    embed.add_field(name="📊 Points & Rank", value=f"{oc['total_points']:,} pts · {rank_text}", inline=False)
     embed.add_field(name="🏷️ Grade", value=oc["grade"] if oc["grade"] else "Ungraded", inline=True)
     dorm_val = f"Floor {oc['dorm_floor']} · Room {oc['dorm_room']}" if oc["dorm_room"] else "Unassigned"
     embed.add_field(name="🏠 Dorm", value=dorm_val, inline=True)
@@ -647,6 +678,11 @@ async def oc_register(interaction: discord.Interaction, name: str, birthday: str
         await interaction.response.defer()
         is_deferred = True
         asset_ch = bot.get_channel(db["config"]["asset_channel"])
+        if not asset_ch:
+            return await interaction.followup.send(
+                embed=get_embed("Configuration Error", "Asset channel not found. Please ask a Dev to reconfigure `/setassetchannel`.", COLOR_ERROR),
+                ephemeral=True
+            )
         img_bytes = await profile_picture.read()
         file = discord.File(fp=io.BytesIO(img_bytes), filename=profile_picture.filename)
         asset_msg = await asset_ch.send(content=f"[OC Asset] `{name}` — owner: <@{interaction.user.id}>", file=file)
@@ -758,9 +794,9 @@ async def eliminate_cmd(interaction: discord.Interaction, mode: str, value: str)
     else:
         return await interaction.response.send_message("Mode must be 'name' or 'rank'.", ephemeral=True)
 
-    recalculate_ranks()
     snap_data = {oc["id"]: {"rank": oc["rank"], "points": oc["total_points"]} for oc in db["ocs"].values() if not oc.get("eliminated", False)}
-    db["rank_snapshots"].append({"timestamp": get_now().isoformat(), "trigger": f"PRE_ELIMINATION_{','.join([t['name'] for t in targets])}", "rankings": snap_data})
+    trigger_ids = "_".join(t["id"][:8] for t in targets)
+    db["rank_snapshots"].append({"timestamp": get_now().isoformat(), "trigger": f"PRE_ELIMINATION_{trigger_ids}", "rankings": snap_data})
 
     for oc in targets:
         oc["eliminated"] = True
@@ -818,14 +854,20 @@ async def vote_close(interaction: discord.Interaction):
     
     for oc_id, v_count in db["voting"]["votes"].items():
         if oc_id in db["ocs"] and not db["ocs"][oc_id].get("eliminated", False):
-            added_pts = v_count * multiplier
-            db["point_log"].append({
-                "timestamp": get_now().isoformat(), "dev_id": interaction.user.id, "dev_name": interaction.user.name,
-                "oc_name": db["ocs"][oc_id]["name"], "action": "vote_close", "value": added_pts,
-                "points_before": db["ocs"][oc_id]["total_points"], "points_after": db["ocs"][oc_id]["total_points"] + added_pts
-            })
+            pts_before = db["ocs"][oc_id]["total_points"]
+            added_pts = round(v_count * multiplier)
             db["ocs"][oc_id]["voting_points"] += added_pts
             db["ocs"][oc_id]["total_points"] += added_pts
+            db["point_log"].append({
+                "timestamp": get_now().isoformat(),
+                "dev_id": interaction.user.id,
+                "dev_name": interaction.user.name,
+                "oc_name": db["ocs"][oc_id]["name"],
+                "action": "vote_close",
+                "value": added_pts,
+                "points_before": pts_before,
+                "points_after": db["ocs"][oc_id]["total_points"]
+            })
             
     recalculate_ranks(); save_db(db)
     channel = bot.get_channel(db["config"]["announcement_channel"]) or interaction.channel
@@ -844,12 +886,27 @@ async def points_cmd(interaction: discord.Interaction, oc_name: str, action: str
     pts_before = oc["total_points"]
     
     if action == "add":
-        oc["mission_points"] += value; oc["total_points"] += value
+        oc["mission_points"] += value
+        oc["total_points"] += value
     elif action == "deduct":
-        oc["total_points"] -= value
-        if not db["config"]["allow_negative_points"] and oc["total_points"] < 0: oc["total_points"] = 0
-    elif action == "multiply": oc["total_points"] = round(oc["total_points"] * value)
-    elif action == "set": oc["total_points"] = value
+        deduct_from_mission = min(value, oc["mission_points"])
+        remaining = value - deduct_from_mission
+        deduct_from_voting = min(remaining, oc["voting_points"])
+        oc["mission_points"] -= deduct_from_mission
+        oc["voting_points"] -= deduct_from_voting
+        oc["total_points"] -= (deduct_from_mission + deduct_from_voting)
+        if not db["config"]["allow_negative_points"] and oc["total_points"] < 0:
+            oc["total_points"] = 0
+            oc["mission_points"] = max(oc["mission_points"], 0)
+            oc["voting_points"] = max(oc["voting_points"], 0)
+    elif action == "multiply":
+        oc["mission_points"] = round(oc["mission_points"] * value)
+        oc["voting_points"] = round(oc["voting_points"] * value)
+        oc["total_points"] = oc["mission_points"] + oc["voting_points"]
+    elif action == "set":
+        oc["mission_points"] = value
+        oc["voting_points"] = 0
+        oc["total_points"] = value
     else: return await interaction.response.send_message("Invalid action.", ephemeral=True)
     
     db["point_log"].append({
@@ -945,7 +1002,7 @@ async def feed_post(
 
     post_record = {
         "post_id": post_id, "oc_id": oc_id, "author_id": interaction.user.id, "author_name": interaction.user.name,
-        "caption": caption, "media_urls": media_urls, "like_count": 0, "thread_id": None, "message_id": post_msg.id,
+        "caption": caption, "media_urls": media_urls, "like_count": 0, "liked_by": [], "thread_id": None, "message_id": post_msg.id,
         "channel_id": post_msg.channel.id, "created_at": now_str
     }
     db["feeds"][oc_id].append(post_record)
@@ -1002,6 +1059,8 @@ async def feed_delete(interaction: discord.Interaction, oc_name: str, post_numbe
     if not (1 <= post_number <= len(oc_posts)): return await interaction.response.send_message(embed=get_embed("Invalid Post Number", f"This OC has {len(oc_posts)} post(s). Provide a number between 1 and {len(oc_posts)}.", COLOR_ERROR), ephemeral=True)
 
     post = oc_posts[post_number - 1]
+    post_id_to_remove = post["post_id"]
+    
     try:
         feed_ch = bot.get_channel(post["channel_id"])
         if feed_ch and post.get("message_id"):
@@ -1010,7 +1069,9 @@ async def feed_delete(interaction: discord.Interaction, oc_name: str, post_numbe
     except (discord.NotFound, discord.Forbidden): pass
 
     db["feeds"][oc["id"]].pop(post_number - 1)
-    oc["feed_post_ids"].pop(post_number - 1)
+    if post_id_to_remove in oc["feed_post_ids"]:
+        oc["feed_post_ids"].remove(post_id_to_remove)
+        
     save_db(db)
     await interaction.response.send_message(embed=get_embed("Post Deleted", f"Post #{post_number} from **{oc['name']}**'s feed has been removed.", COLOR_SUCCESS), ephemeral=True)
 
@@ -1056,6 +1117,21 @@ async def rank_priv(interaction: discord.Interaction):
 async def set_feed_channel(interaction: discord.Interaction, channel: discord.TextChannel):
     db["config"]["feed_channel"] = channel.id; save_db(db)
     await interaction.response.send_message(embed=get_embed("Success", f"Feed channel set to <#{channel.id}>.", COLOR_SUCCESS), ephemeral=True)
+
+@config_group.command(name="settimezone", description="[DEV] Set the timezone for the bot")
+@is_dev()
+async def set_timezone(interaction: discord.Interaction, new_timezone: str):
+    try:
+        zoneinfo.ZoneInfo(new_timezone)
+    except zoneinfo.ZoneInfoNotFoundError:
+        return await interaction.response.send_message(
+            embed=get_embed("Invalid Timezone", f"'{new_timezone}' is not a valid IANA timezone string.", COLOR_ERROR),
+            ephemeral=True
+        )
+    db["config"]["timezone"] = new_timezone
+    save_db(db)
+    await interaction.response.send_message(embed=get_embed("Timezone Set", f"Timezone updated to `{new_timezone}`.", COLOR_SUCCESS), ephemeral=True)
+
 
 @grade_group.command(name="add", description="Add a new grade color")
 @is_dev()
@@ -1321,8 +1397,8 @@ async def dorm_assign_auto(interaction: discord.Interaction, mode: str):
     if total_slots < len(active_ocs):
         await interaction.channel.send(embed=get_embed("⚠️ Slot Deficit", f"Only {total_slots} slots for {len(active_ocs)} OCs. Some will remain unassigned.", COLOR_WARNING))
         
-    # Clear all assignments
-    for oc in active_ocs:
+    # Clear ALL assignments (active and eliminated) to ensure full consistency
+    for oc in db["ocs"].values():
         oc["dorm_floor"] = None
         oc["dorm_room"] = None
     for r in all_rooms:
@@ -1430,9 +1506,9 @@ async def export_data(interaction: discord.Interaction):
     
     writer.writerow(["=== SECTION 1: CURRENT RANKINGS SUMMARY ==="])
     writer.writerow(["rank", "oc_name", "owner_discord_id", "owner_username", "grade", "total_points", "voting_points", "mission_points", "rank_change", "dorm_floor", "dorm_room", "registered_at", "eliminated", "profile_picture_url"])
-    for oc in sorted(db["ocs"].values(), key=lambda x: x["rank"]):
-        change = get_snapshot_diff(oc["id"], oc["rank"])
-        writer.writerow([oc["rank"], oc["name"], oc["owner_id"], oc["owner_name"], oc["grade"] or "", oc["total_points"], oc["voting_points"], oc["mission_points"], change, oc["dorm_floor"] or "", oc["dorm_room"] or "", oc["registered_at"], str(oc.get("eliminated", False)), oc.get("profile_picture_url") or ""])
+    for oc in sorted(db["ocs"].values(), key=lambda x: (x.get("rank") if x.get("rank") is not None else float('inf'))):
+        change = get_snapshot_diff(oc["id"], oc.get("rank"))
+        writer.writerow([oc.get("rank"), oc["name"], oc["owner_id"], oc["owner_name"], oc["grade"] or "", oc["total_points"], oc["voting_points"], oc["mission_points"], change, oc["dorm_floor"] or "", oc["dorm_room"] or "", oc["registered_at"], str(oc.get("eliminated", False)), oc.get("profile_picture_url") or ""])
     
     output.write("\n")
     writer.writerow(["=== SECTION 2: RANK HISTORY ==="])
@@ -1512,4 +1588,9 @@ if __name__ == "__main__":
     if not TOKEN:
         print("CRITICAL: BOT_TOKEN environment variable missing.")
         exit(1)
+
+    health_thread = threading.Thread(target=run_health_server, daemon=True)
+    health_thread.start()
+    print(f"Health server started on port {os.getenv('PORT', 8080)}.")
+
     bot.run(TOKEN)
