@@ -31,11 +31,13 @@ COLORS = {
     "neutral": 0xB0B0B0
 }
 
+KST = zoneinfo.ZoneInfo("Asia/Seoul")
+
 HELP_SECTIONS = {
     "general": {
         "title": "📋 General & Registration",
         "commands": [
-            ("/register", "name birthday_yyyy_mm_dd gender pronouns faceclaim main_skill nationality form_link [ethnicity] [profile_picture]", "Register a new Trainee OC. Each user may have up to the configured OC cap."),
+            ("/register", "name birthday_yyyy_mm_dd gender pronouns faceclaim main_skill nationality [form_link] [ethnicity] [profile_picture]", "Register a new Trainee OC. Each user may have up to the configured OC cap."),
             ("/profile", "oc_name", "View a Trainee's full profile card."),
             ("/oc_all", "", "Browse all currently active Trainees (paginated)."),
             ("/oc_eliminated", "", "View all eliminated Trainees."),
@@ -237,6 +239,12 @@ def load_data():
                 if "feed_post_ids" not in oc:
                     oc["feed_post_ids"] = []
                     modified = True
+                if "birthday" not in oc:
+                    oc["birthday"] = "Unknown"
+                    modified = True
+                if "form_link" not in oc:
+                    oc["form_link"] = None
+                    modified = True
             
             # Schema Migration Guard for Archived OCs
             for oc in data.get("archived_ocs", {}).values():
@@ -248,6 +256,12 @@ def load_data():
                     modified = True
                 if "feed_post_ids" not in oc:
                     oc["feed_post_ids"] = []
+                    modified = True
+                if "birthday" not in oc:
+                    oc["birthday"] = "Unknown"
+                    modified = True
+                if "form_link" not in oc:
+                    oc["form_link"] = None
                     modified = True
 
             # Schema Migration Guard for Dorms: add category_id and room channel_id
@@ -286,20 +300,28 @@ def get_tz():
 def now():
     return datetime.now(get_tz())
 
+def today_kst() -> datetime.date:
+    """Return the current calendar date in Korean Standard Time (UTC+9)."""
+    return datetime.now(KST).date()
+
 def format_dt(dt_str):
     if not dt_str: return "Unknown"
     dt = datetime.fromisoformat(dt_str).astimezone(get_tz())
     return dt.strftime("%b %d, %Y · %H:%M %Z")
 
-def calculate_age(dob_str):
+def calculate_age(dob_str: str) -> int | str:
+    """
+    Calculate age in full years using the current date in KST (UTC+9).
+    Returns an int on success, or the string "Unknown" on parse failure.
+    """
     try:
         dob = datetime.strptime(dob_str, "%Y-%m-%d").date()
-        today = now().date()
+        today = today_kst()
         return today.year - dob.year - ((today.month, today.day) < (dob.month, dob.day))
-    except:
+    except (ValueError, TypeError):
         return "Unknown"
 
-def get_embed(title, description="", color_type="system"):
+def get_embed(title: str, description: str = "", color_type: str = "system", show_footer: bool = False) -> discord.Embed:
     data = load_data()
     color_val = COLORS.get(color_type, COLORS["system"])
     if color_type == "reveal":
@@ -310,7 +332,8 @@ def get_embed(title, description="", color_type="system"):
 
     embed = discord.Embed(title=title, description=description, color=color_val)
     embed.timestamp = now()
-    embed.set_footer(text="Survival Show Sim")
+    if show_footer:
+        embed.set_footer(text="Survival Show Sim")
     return embed
 
 def is_dev():
@@ -607,7 +630,6 @@ class CommentModal(discord.ui.Modal, title="Leave a Comment"):
 
             comment_embed = discord.Embed(description=comment_text, color=COLORS["system"])
             comment_embed.set_author(name=interaction.user.display_name, icon_url=interaction.user.display_avatar.url)
-            comment_embed.set_footer(text=format_dt(now().isoformat()))
             await thread.send(embed=comment_embed)
 
         except discord.Forbidden:
@@ -641,7 +663,8 @@ async def _run_sequential_reveal(channel: discord.TextChannel, ocs_ordered: list
                 sep_embed = get_embed(
                     "✦ THE DEBUT LINE ✦", 
                     f"*The top {debut_slots} trainees above this line will debut.*", 
-                    "reveal"
+                    "reveal",
+                    show_footer=True
                 )
                 await channel.send(embed=sep_embed)
                 await asyncio.sleep(random.uniform(1.5, 2.5))
@@ -668,7 +691,7 @@ async def _run_sequential_reveal(channel: discord.TextChannel, ocs_ordered: list
         await channel.send(embed=sep_embed)
         await asyncio.sleep(random.uniform(2.0, 3.0))
         
-    final_embed = discord.Embed(title="Reveal Complete", description="All rankings have been revealed.", color=reveal_color)
+    final_embed = get_embed("Reveal Complete", "All rankings have been revealed.", "reveal", show_footer=True)
     await channel.send(embed=final_embed)
     
     return pages
@@ -802,7 +825,7 @@ class RegistrationCog(commands.Cog):
         self.bot = bot
 
     @app_commands.command(name="register", description="Register a new Trainee OC")
-    async def register(self, interaction: discord.Interaction, name: str, birthday_yyyy_mm_dd: str, gender: str, pronouns: str, faceclaim: str, main_skill: str, nationality: str, form_link: str, ethnicity: str = "Unknown", profile_picture: discord.Attachment = None):
+    async def register(self, interaction: discord.Interaction, name: str, birthday_yyyy_mm_dd: str, gender: str, pronouns: str, faceclaim: str, main_skill: str, nationality: str, form_link: str = None, ethnicity: str = "Unknown", profile_picture: discord.Attachment = None):
         data = load_data()
         user_id = str(interaction.user.id)
         current_ocs = len([oc for oc in data["ocs"].values() if oc["owner_id"] == user_id])
@@ -846,7 +869,7 @@ class RegistrationCog(commands.Cog):
             "main_skill": main_skill,
             "nationality": nationality,
             "ethnicity": ethnicity,
-            "form_link": form_link,
+            "form_link": form_link or None,
             "profile_picture_url": profile_picture_url,
             "eliminated": False,
             "grade": None,
@@ -911,7 +934,7 @@ class RegistrationCog(commands.Cog):
                 dorm_str = f"{oc['dorm_floor']} · {oc['dorm_room']}" if oc.get('dorm_floor') else "Unassigned"
                 
                 desc = (
-                    f"**Birthday**: {oc['birthday']} ({age} yrs)\n"
+                    f"**Birthday / Age**: {oc['birthday']} · {age} yrs (KST)\n"
                     f"**Gender / Pronouns**: {oc['gender']} · {oc['pronouns']}\n"
                     f"**Faceclaim**: {oc['faceclaim']}\n"
                     f"**Skill**: {oc['main_skill']}\n"
@@ -1037,17 +1060,18 @@ class RegistrationCog(commands.Cog):
             embed.color = COLORS["error"]
 
         age = calculate_age(oc["birthday"])
-        embed.add_field(name="🎂 Birthday · Age", value=f"{oc['birthday']} · {age} yrs", inline=True)
-        embed.add_field(name="🪪 Gender · Pronouns", value=f"{oc['gender']} · {oc['pronouns']}", inline=True)
-        embed.add_field(name="🎭 Faceclaim", value=oc["faceclaim"], inline=True)
-        embed.add_field(name="🎤 Main Skill", value=oc["main_skill"], inline=True)
-        embed.add_field(name="🌏 Nationality · Ethnicity", value=f"{oc['nationality']} · {oc['ethnicity']}", inline=True)
-        embed.add_field(name="🔗 Profile", value=f"[View Full Form]({oc['form_link']})", inline=True)
+        embed.add_field(name="Birthday / Age", value=f"{oc['birthday']} · {age} yrs (KST)", inline=True)
+        embed.add_field(name="Gender / Pronouns", value=f"{oc['gender']} · {oc['pronouns']}", inline=True)
+        embed.add_field(name="Faceclaim", value=oc["faceclaim"], inline=True)
+        embed.add_field(name="Main Skill", value=oc["main_skill"], inline=True)
+        embed.add_field(name="Nationality / Ethnicity", value=f"{oc['nationality']} · {oc['ethnicity']}", inline=True)
+        if oc.get("form_link"):
+            embed.add_field(name="Profile", value=f"[View Full Form]({oc['form_link']})", inline=True)
         
         rank_str = "Eliminated" if oc.get("eliminated", False) else f"Rank #{oc.get('current_rank', 0)}"
-        embed.add_field(name="📊 Points · Rank", value=f"{oc['total_points']:,} pts · {rank_str}", inline=True)
-        embed.add_field(name="🏷️ Grade", value=grade if grade else "Ungraded", inline=True)
-        embed.add_field(name="🏠 Dorm", value=f"{oc['dorm_floor']} · {oc['dorm_room']}" if oc.get('dorm_floor') else "Unassigned", inline=True)
+        embed.add_field(name="Points / Rank", value=f"{oc['total_points']:,} pts · {rank_str}", inline=True)
+        embed.add_field(name="Grade", value=grade if grade else "Ungraded", inline=True)
+        embed.add_field(name="Dorm", value=f"{oc['dorm_floor']} · {oc['dorm_room']}" if oc.get('dorm_floor') else "Unassigned", inline=True)
         
         if data["config"].get("peer_ranking_enabled"):
             last_resolved = next(
@@ -1056,14 +1080,13 @@ class RegistrationCog(commands.Cog):
             )
             if last_resolved:
                 if last_resolved.get("benefit_applied_to") == oc["id"]:
-                    embed.add_field(name="⭐ Legacy Multiplier", value="Received peer top ranking last session.", inline=False)
+                    embed.add_field(name="Legacy Multiplier", value="Received peer top ranking last session.", inline=False)
                 elif last_resolved.get("penalty_applied_to") == oc["id"]:
-                    embed.add_field(name="💀 Popularity Tax", value="Received peer bottom ranking last session.", inline=False)
+                    embed.add_field(name="Popularity Tax", value="Received peer bottom ranking last session.", inline=False)
 
         if oc.get("profile_picture_url"):
             embed.set_thumbnail(url=oc["profile_picture_url"])
 
-        embed.set_footer(text=f"Registered by @{oc['owner_name']} · {format_dt(oc['registered_at'])}")
         return embed
 
 class VotingCog(commands.Cog):
@@ -1080,7 +1103,7 @@ class VotingCog(commands.Cog):
             return await interaction.response.send_message(
                 embed=get_embed(
                     "Voting Closed",
-                    "🚫 Voting is currently closed. Stay tuned for the next evaluation period.",
+                    "Voting is currently closed. Stay tuned for the next evaluation period.",
                     "error"
                 ),
                 ephemeral=True
@@ -1235,7 +1258,7 @@ class VotingCog(commands.Cog):
         channel_id = data["config"]["announcement_channel_id"]
         if channel_id:
             channel = self.bot.get_channel(int(channel_id))
-            embed = get_embed("Voting Closed", "The evaluation period has ended. The votes have been tallied and rankings updated.", "system")
+            embed = get_embed("Voting Closed", "The evaluation period has ended. The votes have been tallied and rankings updated.", "system", show_footer=True)
             await channel.send(embed=embed)
         
         await interaction.followup.send(embed=get_embed("Success", "Voting closed and tallied.", "success"))
@@ -2053,7 +2076,7 @@ class RankingsCog(commands.Cog):
             desc += f"**#{oc['current_rank']}** {change} · {oc['name']}{grade_str} · {oc['total_points']:,} pts\n"
             prev_rank = oc["current_rank"]
             
-        embed = get_embed("Live Internal Rankings", desc)
+        embed = get_embed("Live Internal Rankings", desc, show_footer=True)
         
         snapshot = {
             "timestamp": now().isoformat(),
@@ -2070,7 +2093,7 @@ class RankingsCog(commands.Cog):
     async def reveal(self, interaction: discord.Interaction):
         data = load_data()
         color = hex_to_int(data["config"]["reveal_color"])
-        await interaction.response.send_message(embed=get_embed("Evaluation Begins", "🎬 *The moment you've all been waiting for…*", "reveal"))
+        await interaction.response.send_message(embed=get_embed("Evaluation Begins", "*The moment you've all been waiting for…*", "reveal", show_footer=True))
         
         channel_id = data["config"].get("announcement_channel_id")
         channel = self.bot.get_channel(int(channel_id)) if channel_id else interaction.channel
@@ -2082,7 +2105,7 @@ class RankingsCog(commands.Cog):
         page_embeds = await _run_sequential_reveal(channel, active_ocs, color, page_size, data, show_debut_line=True)
         
         await interaction.followup.send(
-            embed=get_embed("📖 Browse Results", f"Scroll through all {len(page_embeds)} page(s).", "reveal"),
+            embed=get_embed("📖 Browse Results", f"Scroll through all {len(page_embeds)} page(s).", "reveal", show_footer=True),
             view=RankingPaginationView(page_embeds)
         )
 
@@ -2091,7 +2114,7 @@ class RankingsCog(commands.Cog):
     async def partial(self, interaction: discord.Interaction, start_rank: int, end_rank: int):
         data = load_data()
         color = hex_to_int(data["config"]["reveal_color"])
-        await interaction.response.send_message(embed=get_embed("Evaluation Begins", f"🎬 *Revealing ranks {start_rank} to {end_rank}…*", "reveal"))
+        await interaction.response.send_message(embed=get_embed("Evaluation Begins", f"*Revealing ranks {start_rank} to {end_rank}…*", "reveal", show_footer=True))
         
         channel_id = data["config"].get("announcement_channel_id")
         channel = self.bot.get_channel(int(channel_id)) if channel_id else interaction.channel
@@ -2107,7 +2130,7 @@ class RankingsCog(commands.Cog):
         page_embeds = await _run_sequential_reveal(channel, active_ocs, color, page_size, data, show_debut_line=False)
         
         await interaction.followup.send(
-            embed=get_embed("📖 Browse Results", f"Scroll through all {len(page_embeds)} page(s).", "reveal"),
+            embed=get_embed("📖 Browse Results", f"Scroll through all {len(page_embeds)} page(s).", "reveal", show_footer=True),
             view=RankingPaginationView(page_embeds)
         )
 
@@ -2190,7 +2213,7 @@ class HelpCog(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
 
-    @app_commands.command(name="help", description="Display a guide to all bot commands")
+    @app_commands.command(name="guide", description="Display a guide to all bot commands")
     @app_commands.describe(section="Jump to a specific topic (optional)")
     @app_commands.choices(section=[
         app_commands.Choice(name="General & Registration", value="general"),
@@ -2204,38 +2227,40 @@ class HelpCog(commands.Cog):
         app_commands.Choice(name="Configuration",          value="config"),
     ])
     async def help_cmd(self, interaction: discord.Interaction, section: app_commands.Choice[str] = None):
-        if section is None:
-            # Build the index overview page
-            embed = get_embed(
-                "📖 Survival Show Sim — Command Guide",
-                "Use `/help section:<name>` to drill into any topic.\n\u200b",
-                "system"
-            )
-            for key, sec in HELP_SECTIONS.items():
-                public_count = len(sec["commands"])
-                dev_count    = len(sec["dev_commands"])
-                embed.add_field(
-                    name=sec["title"],
-                    value=(
-                        f"{public_count} public command(s)"
-                        + (f" · {dev_count} staff command(s) 🔒" if dev_count else "")
-                        + f"\n`/help section:{key}`"
-                    ),
-                    inline=True
+        try:
+            if section is None:
+                # Build the index overview page
+                embed = get_embed(
+                    "Survival Show Sim — Command Guide",
+                    "Use `/guide section:<name>` to drill into any topic.\n\u200b",
+                    "system"
                 )
-            embed.set_footer(text="🔒 = Dev/Staff only  ·  Survival Show Sim")
-            return await interaction.response.send_message(embed=embed, ephemeral=True)
+                for key, sec in HELP_SECTIONS.items():
+                    public_count = len(sec["commands"])
+                    dev_count    = len(sec["dev_commands"])
+                    embed.add_field(
+                        name=sec["title"],
+                        value=(
+                            f"{public_count} public command(s)"
+                            + (f" · {dev_count} staff command(s) 🔒" if dev_count else "")
+                            + f"\n`/guide section:{key}`"
+                        ),
+                        inline=True
+                    )
+                return await interaction.response.send_message(embed=embed, ephemeral=True)
 
-        # Specific section page
-        sec = HELP_SECTIONS[section.value]
-        embed = get_embed(sec["title"], "", "system")
+            # Specific section page
+            sec = HELP_SECTIONS[section.value]
+            
+            if not sec["commands"] and not sec["dev_commands"]:
+                embed = get_embed(sec["title"], "This section has no commands listed yet.", "system")
+                return await interaction.response.send_message(embed=embed, ephemeral=True)
 
-        all_entries = [(cmd, params, desc, False) for cmd, params, desc in sec["commands"]] + \
-                      [(cmd, params, desc, True)  for cmd, params, desc in sec["dev_commands"]]
+            embed = get_embed(sec["title"], "", "system")
 
-        if not all_entries:
-            embed.description = "*No commands in this section.*"
-        else:
+            all_entries = [(cmd, params, desc, False) for cmd, params, desc in sec["commands"]] + \
+                          [(cmd, params, desc, True)  for cmd, params, desc in sec["dev_commands"]]
+
             for cmd, params, desc, is_dev_cmd in all_entries:
                 usage = f"`{cmd}`" + (f" `{params}`" if params else "")
                 embed.add_field(
@@ -2244,8 +2269,13 @@ class HelpCog(commands.Cog):
                     inline=False
                 )
 
-        embed.set_footer(text="🔒 = Dev/Staff only  ·  Survival Show Sim")
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+        except Exception as e:
+            err_embed = get_embed("Error", f"Failed to load the guide: `{e}`", "error")
+            if interaction.response.is_done():
+                await interaction.followup.send(embed=err_embed, ephemeral=True)
+            else:
+                await interaction.response.send_message(embed=err_embed, ephemeral=True)
 
 class FeedCog(commands.Cog):
     def __init__(self, bot):
@@ -2337,10 +2367,10 @@ class FeedCog(commands.Cog):
             
         if len(media_urls) > 1:
             links = "\n".join(f"[Media {idx+1}]({url})" for idx, url in enumerate(media_urls[1:], start=1))
-            post_embed.add_field(name="📎 Additional Media", value=links, inline=False)
+            post_embed.add_field(name="Additional Media", value=links, inline=False)
             
         post_num = len(oc.get("feed_post_ids", [])) + 1
-        post_embed.add_field(name="📬 Post", value=f"{post_num} / 10", inline=True)
+        post_embed.add_field(name="Post", value=f"{post_num} / 10", inline=True)
         
         feed_ch = self.bot.get_channel(int(data["config"]["feed_channel"]))
         if not feed_ch:
@@ -2404,12 +2434,11 @@ class FeedCog(commands.Cog):
                     
             if len(post["media_urls"]) > 1:
                 links = "\n".join(f"[Media {i+1}]({u})" for i, u in enumerate(post["media_urls"][1:], start=1))
-                embed.add_field(name="📎 Additional Media", value=links, inline=False)
+                embed.add_field(name="Additional Media", value=links, inline=False)
                 
             thread_link = f"[View Thread](https://discord.com/channels/{interaction.guild_id}/{post['channel_id']}/{post['thread_id']})" if post.get("thread_id") else "No comments yet."
-            embed.add_field(name="💬 Comments", value=thread_link, inline=True)
+            embed.add_field(name="Comments", value=thread_link, inline=True)
             embed.add_field(name="❤️ Likes", value=str(post["like_count"]), inline=True)
-            embed.set_footer(text=f"Posted by @{post['author_name']}  ·  {format_dt(post['created_at'])}")
             pages.append(embed)
             
         if len(pages) == 1:
