@@ -86,15 +86,29 @@ def load_db():
             if "last_closed_at" not in data["voting"]: data["voting"]["last_closed_at"] = None
             if "user_votes" not in data["voting"]: data["voting"]["user_votes"] = {}
             
+            # Dorm room schema migration: add "created_at" and "label" if missing
+            for floor_label, floor_data in data.get("dorms", {}).items():
+                if "label" not in floor_data: floor_data["label"] = floor_label
+                if "created_at" not in floor_data: floor_data["created_at"] = get_now().isoformat()
+                for room_label, room_data in floor_data.get("rooms", {}).items():
+                    if "label" not in room_data: room_data["label"] = room_label
+                    if "created_at" not in room_data: room_data["created_at"] = get_now().isoformat()
+                    if "capacity" not in room_data: room_data["capacity"] = 4  # default fallback
+                    if "occupants" not in room_data: room_data["occupants"] = []
+
             # OC Schema Migrations
             for oc in data.get("ocs", {}).values():
                 if "profile_picture_url" not in oc: oc["profile_picture_url"] = None
                 if "eliminated" not in oc: oc["eliminated"] = False
                 if "feed_post_ids" not in oc: oc["feed_post_ids"] = []
+                if "dorm_floor" not in oc: oc["dorm_floor"] = None
+                if "dorm_room" not in oc: oc["dorm_room"] = None
             for oc in data.get("archived_ocs", {}).values():
                 if "profile_picture_url" not in oc: oc["profile_picture_url"] = None
                 if "eliminated" not in oc: oc["eliminated"] = False
                 if "feed_post_ids" not in oc: oc["feed_post_ids"] = []
+                if "dorm_floor" not in oc: oc["dorm_floor"] = None
+                if "dorm_room" not in oc: oc["dorm_room"] = None
 
             return data
     except json.JSONDecodeError:
@@ -304,6 +318,135 @@ class ConfirmResetView(discord.ui.View):
     async def on_timeout(self):
         await self._disable_all()
 
+class GradeRemoveConfirmView(discord.ui.View):
+    def __init__(self, canon_label, affected_ocs):
+        super().__init__(timeout=30)
+        self.canon_label = canon_label
+        self.affected_ocs = affected_ocs
+        self.message = None
+        
+    async def _disable_all(self):
+        for item in self.children: item.disabled = True
+        if self.message:
+            try: await self.message.edit(view=self)
+            except: pass
+
+    @discord.ui.button(label="✅ Confirm Remove", style=discord.ButtonStyle.danger)
+    async def confirm_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._disable_all()
+        del db["grades"][self.canon_label]
+        for oc in self.affected_ocs:
+            oc["grade"] = None
+        save_db(db)
+        await interaction.response.edit_message(embed=get_embed("Grade Removed", f"**{self.canon_label}** removed. {len(self.affected_ocs)} Trainee(s) updated to Ungraded.", COLOR_SUCCESS), view=self)
+        
+    @discord.ui.button(label="✖ Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._disable_all()
+        await interaction.response.edit_message(embed=get_embed("Cancelled", "Grade removal aborted.", COLOR_SYSTEM), view=self)
+
+    async def on_timeout(self):
+        await self._disable_all()
+
+class DormFloorDeleteConfirmView(discord.ui.View):
+    def __init__(self, canon_floor):
+        super().__init__(timeout=30)
+        self.canon_floor = canon_floor
+        self.message = None
+        
+    async def _disable_all(self):
+        for item in self.children: item.disabled = True
+        if self.message:
+            try: await self.message.edit(view=self)
+            except: pass
+
+    @discord.ui.button(label="✅ Confirm Delete", style=discord.ButtonStyle.danger)
+    async def confirm_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._disable_all()
+        floor_data = db["dorms"].get(self.canon_floor, {})
+        evicted = 0
+        for r_data in floor_data.get("rooms", {}).values():
+            for oid in r_data.get("occupants", []):
+                if oid in db["ocs"]:
+                    db["ocs"][oid]["dorm_floor"] = None
+                    db["ocs"][oid]["dorm_room"] = None
+                    evicted += 1
+        
+        if self.canon_floor in db["dorms"]:
+            del db["dorms"][self.canon_floor]
+        save_db(db)
+        await interaction.response.edit_message(embed=get_embed("Floor Deleted", f"**{self.canon_floor}** deleted. {evicted} Trainee(s) evicted.", COLOR_SUCCESS), view=self)
+
+    @discord.ui.button(label="✖ Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._disable_all()
+        await interaction.response.edit_message(embed=get_embed("Cancelled", "Floor deletion aborted.", COLOR_SYSTEM), view=self)
+
+    async def on_timeout(self):
+        await self._disable_all()
+
+class DormResetConfirmView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=30)
+        self.message = None
+        
+    async def _disable_all(self):
+        for item in self.children: item.disabled = True
+        if self.message:
+            try: await self.message.edit(view=self)
+            except: pass
+
+    @discord.ui.button(label="✅ Confirm Unassign", style=discord.ButtonStyle.danger)
+    async def confirm_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._disable_all()
+        evicted = 0
+        for oc in db["ocs"].values():
+            if oc["dorm_floor"] or oc["dorm_room"]:
+                oc["dorm_floor"] = None
+                oc["dorm_room"] = None
+                evicted += 1
+        for f_data in db["dorms"].values():
+            for r_data in f_data.get("rooms", {}).values():
+                r_data["occupants"] = []
+                
+        save_db(db)
+        await interaction.response.edit_message(embed=get_embed("Reset Complete", f"Unassigned all dorms. {evicted} Trainee(s) evicted.", COLOR_SUCCESS), view=self)
+
+    @discord.ui.button(label="✖ Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._disable_all()
+        await interaction.response.edit_message(embed=get_embed("Cancelled", "Reset aborted.", COLOR_SYSTEM), view=self)
+
+    async def on_timeout(self):
+        await self._disable_all()
+
+class DormNukeModal(discord.ui.Modal, title="Confirm Dorm Nuke"):
+    confirm_text = discord.ui.TextInput(
+        label="Type 'CONFIRM DORM NUKE'",
+        placeholder="CONFIRM DORM NUKE",
+        style=discord.TextStyle.short,
+        required=True
+    )
+    
+    async def on_submit(self, interaction: discord.Interaction):
+        if self.confirm_text.value != "CONFIRM DORM NUKE":
+            return await interaction.response.send_message(embed=get_embed("Aborted", "Confirmation text did not match.", COLOR_ERROR), ephemeral=True)
+            
+        evicted = 0
+        for oc in db["ocs"].values():
+            if oc["dorm_floor"] or oc["dorm_room"]:
+                oc["dorm_floor"] = None
+                oc["dorm_room"] = None
+                evicted += 1
+                
+        floors = len(db["dorms"])
+        rooms = sum(len(f.get("rooms", {})) for f in db["dorms"].values())
+        
+        db["dorms"] = {}
+        save_db(db)
+        
+        await interaction.response.send_message(embed=get_embed("Nuke Complete", f"Deleted {floors} floors and {rooms} rooms. Evicted {evicted} Trainee(s).", COLOR_SUCCESS), ephemeral=True)
+
 class FeedPostView(discord.ui.View):
     """
     Persistent view attached to every feed post message.
@@ -449,10 +592,13 @@ oc_group = app_commands.Group(name="oc", description="OC Management commands")
 
 def build_profile_embed(oc):
     grade_emoji = "⭐"
-    color = COLOR_UNGRADED
     if oc["grade"] and oc["grade"] in db["grades"]:
         color = hex_to_int(db["grades"][oc["grade"]])
         grade_emoji = oc["grade"]
+    else:
+        # Grade was deleted or OC is ungraded
+        oc_grade_display = oc["grade"] if oc["grade"] else "Ungraded"
+        color = COLOR_UNGRADED
 
     embed = get_embed(f"{oc['name']} {grade_emoji}", color=color)
     if oc.get("eliminated", False):
@@ -562,6 +708,32 @@ async def oc_all(interaction: discord.Interaction):
         msg = await interaction.response.send_message(embed=pages[0], view=view)
         view.message = msg
 
+@oc_group.command(name="grade", description="[DEV] Assign a grade to a Trainee")
+@is_dev()
+async def oc_grade(interaction: discord.Interaction, oc_name: str, grade_label: str):
+    matches = [oc for oc in db["ocs"].values() if not oc.get("eliminated", False) and oc["name"].lower() == oc_name.lower()]
+    if not matches: return await interaction.response.send_message(embed=get_embed("Not Found", "No active Trainee found by that name.", COLOR_ERROR), ephemeral=True)
+    
+    oc = matches[0]
+    
+    if grade_label.lower() == "none":
+        oc["grade"] = None
+        save_db(db)
+        await interaction.response.send_message(embed=get_embed("Grade Removed", f"Cleared grade for {oc['name']}.", COLOR_SUCCESS), ephemeral=True)
+        # Using followup.send to circumvent embeds=[] list limitations in some discord.py versions
+        await interaction.followup.send(embed=build_profile_embed(oc), ephemeral=True)
+        return
+        
+    canon_grade = next((k for k in db["grades"] if k.lower() == grade_label.lower()), None)
+    if not canon_grade:
+        valid_grades = ", ".join(db["grades"].keys()) if db["grades"] else "None available"
+        return await interaction.response.send_message(embed=get_embed("Invalid Grade", f"Grade not found. Available: {valid_grades}", COLOR_ERROR), ephemeral=True)
+        
+    oc["grade"] = canon_grade
+    save_db(db)
+    await interaction.response.send_message(embed=get_embed("Grade Assigned", f"Set grade **{canon_grade}** for {oc['name']}.", COLOR_SUCCESS), ephemeral=True)
+    await interaction.followup.send(embed=build_profile_embed(oc), ephemeral=True)
+
 bot.tree.add_command(oc_group)
 
 # ==========================================
@@ -591,8 +763,11 @@ async def eliminate_cmd(interaction: discord.Interaction, mode: str, value: str)
     for oc in targets:
         oc["eliminated"] = True
         if oc["dorm_floor"] and oc["dorm_room"]:
-            try: db["dorms"][oc["dorm_floor"]]["rooms"][oc["dorm_room"]]["occupants"].remove(oc["id"])
-            except ValueError: pass
+            floor_data = db["dorms"].get(oc["dorm_floor"], {})
+            room_data = floor_data.get("rooms", {}).get(oc["dorm_room"], {})
+            occupants = room_data.get("occupants", [])
+            if oc["id"] in occupants:
+                occupants.remove(oc["id"])
             oc["dorm_floor"] = None; oc["dorm_room"] = None
 
     recalculate_ranks(); save_db(db)
@@ -849,10 +1024,12 @@ bot.tree.add_command(missiongroup_group)
 bot.tree.add_command(peerranking_group)
 
 # ==========================================
-# 6. CONFIG, REVEALS & EXPORTS
+# 6. CONFIG, REVEALS, GRADES, DORMS & EXPORTS
 # ==========================================
 rank_group = app_commands.Group(name="rankings", description="Ranking Reveals")
 config_group = app_commands.Group(name="config", description="[DEV] Configuration Commands")
+grade_group = app_commands.Group(name="grade", description="[DEV] Grade & Color Management")
+dorm_group = app_commands.Group(name="dorm", description="[DEV] Dorm Management")
 
 @rank_group.command(name="private", description="[DEV] Save snapshot and view private rankings")
 @is_dev()
@@ -878,8 +1055,370 @@ async def set_feed_channel(interaction: discord.Interaction, channel: discord.Te
     db["config"]["feed_channel"] = channel.id; save_db(db)
     await interaction.response.send_message(embed=get_embed("Success", f"Feed channel set to <#{channel.id}>.", COLOR_SUCCESS), ephemeral=True)
 
+@grade_group.command(name="add", description="Add a new grade color")
+@is_dev()
+async def grade_add(interaction: discord.Interaction, label: str, hex_color: str):
+    if not re.match(r'^#?[0-9A-Fa-f]{6}$', hex_color):
+        return await interaction.response.send_message(embed=get_embed("Invalid Color", "Please use a valid 6-character hex code.", COLOR_ERROR), ephemeral=True)
+        
+    canon_hex = "#" + hex_color.lstrip("#").upper()
+    
+    if any(k.lower() == label.lower() for k in db["grades"]):
+        return await interaction.response.send_message(embed=get_embed("Collision", f"A grade named '{label}' already exists. Use `/grade edit` instead.", COLOR_WARNING), ephemeral=True)
+        
+    db["grades"][label] = canon_hex
+    save_db(db)
+    
+    embed = get_embed("Grade Created", "", hex_to_int(canon_hex))
+    embed.add_field(name="Label", value=label, inline=True)
+    embed.add_field(name="Hex Code", value=canon_hex, inline=True)
+    embed.add_field(name="Preview Color", value="<- Look at the embed color edge", inline=True)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+@grade_group.command(name="edit", description="Edit an existing grade's color")
+@is_dev()
+async def grade_edit(interaction: discord.Interaction, label: str, new_hex_color: str):
+    if not re.match(r'^#?[0-9A-Fa-f]{6}$', new_hex_color):
+        return await interaction.response.send_message(embed=get_embed("Invalid Color", "Please use a valid 6-character hex code.", COLOR_ERROR), ephemeral=True)
+        
+    canon_hex = "#" + new_hex_color.lstrip("#").upper()
+    canon_label = next((k for k in db["grades"] if k.lower() == label.lower()), None)
+    
+    if not canon_label:
+        return await interaction.response.send_message(embed=get_embed("Not Found", f"Grade '{label}' not found.", COLOR_ERROR), ephemeral=True)
+        
+    old_hex = db["grades"][canon_label]
+    db["grades"][canon_label] = canon_hex
+    save_db(db)
+    
+    # Note: No need to iterate OCs. Embed color is derived at render time from db["grades"].
+    embed = get_embed("Grade Updated", f"Changed color for **{canon_label}** from {old_hex} to {canon_hex}", hex_to_int(canon_hex))
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+@grade_group.command(name="remove", description="Remove a grade")
+@is_dev()
+async def grade_remove(interaction: discord.Interaction, label: str):
+    canon_label = next((k for k in db["grades"] if k.lower() == label.lower()), None)
+    if not canon_label:
+        return await interaction.response.send_message(embed=get_embed("Not Found", f"Grade '{label}' not found.", COLOR_ERROR), ephemeral=True)
+        
+    affected_ocs = [oc for oc in db["ocs"].values() if not oc.get("eliminated") and oc["grade"] and oc["grade"].lower() == canon_label.lower()]
+    
+    if affected_ocs:
+        names = [oc["name"] for oc in affected_ocs]
+        display_names = ", ".join(names[:10]) + (f" ... and {len(names)-10} more" if len(names) > 10 else "")
+        view = GradeRemoveConfirmView(canon_label, affected_ocs)
+        await interaction.response.send_message(
+            embed=get_embed("⚠️ Grade in Use", f"**{canon_label}** is currently assigned to {len(affected_ocs)} Trainee(s):\n{display_names}\n\nRemoving this grade will set their grade to Ungraded. Confirm?", COLOR_WARNING),
+            view=view,
+            ephemeral=True
+        )
+        view.message = await interaction.original_response()
+    else:
+        del db["grades"][canon_label]
+        save_db(db)
+        await interaction.response.send_message(embed=get_embed("Grade Removed", f"**{canon_label}** has been removed.", COLOR_SUCCESS), ephemeral=True)
+
+@grade_group.command(name="list", description="List all grades and colors")
+async def grade_list(interaction: discord.Interaction):
+    if not db["grades"]:
+        return await interaction.response.send_message(embed=get_embed("No Grades", "No grades have been created yet.", COLOR_WARNING), ephemeral=True)
+        
+    entries = []
+    for canon_label, hex_val in db["grades"].items():
+        count = sum(1 for oc in db["ocs"].values() if not oc.get("eliminated") and oc["grade"] and oc["grade"].lower() == canon_label.lower())
+        entries.append((canon_label, hex_val, count))
+        
+    page_size = 10
+    pages = []
+    for i in range(0, len(entries), page_size):
+        batch = entries[i:i+page_size]
+        last_hex = batch[-1][1]
+        embed = get_embed(f"Grades (Page {(i//page_size)+1} of {(len(entries)+page_size-1)//page_size})", "", hex_to_int(last_hex))
+        for label, hex_val, count in batch:
+            embed.add_field(name=label, value=f"Hex: `{hex_val}`\nActive OCs: {count}", inline=True)
+        pages.append(embed)
+        
+    if len(pages) == 1:
+        await interaction.response.send_message(embed=pages[0])
+    else:
+        view = RankingPaginationView(pages)
+        msg = await interaction.response.send_message(embed=pages[0], view=view)
+        view.message = msg
+
+@dorm_group.command(name="floor_create", description="Create a new dorm floor")
+@is_dev()
+async def dorm_floor_create(interaction: discord.Interaction, floor_label: str):
+    if len(floor_label) > 32 or not re.match(r'^[A-Za-z0-9 _\-]+$', floor_label):
+        return await interaction.response.send_message(embed=get_embed("Invalid Label", "Max 32 chars, only letters, numbers, spaces, underscores, hyphens.", COLOR_ERROR), ephemeral=True)
+        
+    if any(k.lower() == floor_label.lower() for k in db["dorms"]):
+        return await interaction.response.send_message(embed=get_embed("Collision", f"Floor '{floor_label}' already exists.", COLOR_ERROR), ephemeral=True)
+        
+    db["dorms"][floor_label] = {"label": floor_label, "rooms": {}, "created_at": get_now().isoformat()}
+    save_db(db)
+    await interaction.response.send_message(embed=get_embed("Floor Created", f"Created floor **{floor_label}**.", COLOR_SUCCESS), ephemeral=True)
+
+@dorm_group.command(name="floor_list", description="List all dorm floors")
+@is_dev()
+async def dorm_floor_list(interaction: discord.Interaction):
+    if not db["dorms"]:
+        return await interaction.response.send_message(embed=get_embed("No Floors", "No floors created yet.", COLOR_WARNING), ephemeral=True)
+        
+    embed = get_embed("Dorm Floors")
+    for floor_label, floor_data in db["dorms"].items():
+        rooms = floor_data.get("rooms", {})
+        total_cap = sum(r.get("capacity", 0) for r in rooms.values())
+        total_occ = sum(len(r.get("occupants", [])) for r in rooms.values())
+        embed.add_field(name=f"Floor {floor_label}", value=f"Rooms: {len(rooms)}\nCapacity: {total_occ} / {total_cap}", inline=False)
+        
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+@dorm_group.command(name="floor_delete", description="Delete a dorm floor")
+@is_dev()
+async def dorm_floor_delete(interaction: discord.Interaction, floor_label: str):
+    canon_floor = next((k for k in db["dorms"] if k.lower() == floor_label.lower()), None)
+    if not canon_floor:
+        return await interaction.response.send_message(embed=get_embed("Not Found", "Floor not found.", COLOR_ERROR), ephemeral=True)
+        
+    floor_data = db["dorms"][canon_floor]
+    total_occ = sum(len(r.get("occupants", [])) for r in floor_data.get("rooms", {}).values())
+    
+    if total_occ > 0:
+        view = DormFloorDeleteConfirmView(canon_floor)
+        await interaction.response.send_message(
+            embed=get_embed("⚠️ Floor Occupied", f"**{canon_floor}** has {total_occ} occupant(s). Deleting it will evict them. Confirm?", COLOR_WARNING),
+            view=view, ephemeral=True
+        )
+        view.message = await interaction.original_response()
+    else:
+        del db["dorms"][canon_floor]
+        save_db(db)
+        await interaction.response.send_message(embed=get_embed("Floor Deleted", f"Deleted empty floor **{canon_floor}**.", COLOR_SUCCESS), ephemeral=True)
+
+@dorm_group.command(name="room_create", description="Create a new dorm room")
+@is_dev()
+async def dorm_room_create(interaction: discord.Interaction, floor_label: str, room_label: str, capacity: int):
+    canon_floor = next((k for k in db["dorms"] if k.lower() == floor_label.lower()), None)
+    if not canon_floor:
+        valid = ", ".join(db["dorms"].keys()) if db["dorms"] else "None"
+        return await interaction.response.send_message(embed=get_embed("Invalid Floor", f"Available: {valid}", COLOR_ERROR), ephemeral=True)
+        
+    if len(room_label) > 32 or not re.match(r'^[A-Za-z0-9 _\-]+$', room_label):
+        return await interaction.response.send_message(embed=get_embed("Invalid Label", "Max 32 chars, only letters, numbers, spaces, underscores, hyphens.", COLOR_ERROR), ephemeral=True)
+        
+    if capacity < 1 or capacity > 20:
+        return await interaction.response.send_message(embed=get_embed("Invalid Capacity", "Capacity must be between 1 and 20.", COLOR_ERROR), ephemeral=True)
+        
+    floor_data = db["dorms"][canon_floor]
+    if any(k.lower() == room_label.lower() for k in floor_data.get("rooms", {})):
+        return await interaction.response.send_message(embed=get_embed("Collision", f"Room '{room_label}' already exists on floor '{canon_floor}'.", COLOR_ERROR), ephemeral=True)
+        
+    floor_data["rooms"][room_label] = {
+        "label": room_label, "capacity": capacity, "occupants": [], "created_at": get_now().isoformat()
+    }
+    save_db(db)
+    await interaction.response.send_message(embed=get_embed("Room Created", f"Floor: {canon_floor}\nRoom: {room_label}\nCapacity: {capacity}", COLOR_SUCCESS), ephemeral=True)
+
+@dorm_group.command(name="room_list", description="List rooms on a floor")
+@is_dev()
+async def dorm_room_list(interaction: discord.Interaction, floor_label: str):
+    canon_floor = next((k for k in db["dorms"] if k.lower() == floor_label.lower()), None)
+    if not canon_floor:
+        return await interaction.response.send_message(embed=get_embed("Not Found", "Floor not found.", COLOR_ERROR), ephemeral=True)
+        
+    rooms = db["dorms"][canon_floor].get("rooms", {})
+    if not rooms:
+        return await interaction.response.send_message(embed=get_embed("No Rooms", f"No rooms on floor {canon_floor}.", COLOR_WARNING), ephemeral=True)
+        
+    pages = []
+    room_list = list(rooms.values())
+    page_size = 10
+    for i in range(0, len(room_list), page_size):
+        batch = room_list[i:i+page_size]
+        embed = get_embed(f"Rooms on Floor {canon_floor} (Page {(i//page_size)+1} of {(len(room_list)+page_size-1)//page_size})")
+        for r in batch:
+            occ_names = [db["ocs"].get(oid, {}).get("name", "Unknown") for oid in r["occupants"]]
+            names_str = ", ".join(occ_names) if occ_names else "Empty"
+            embed.add_field(name=f"Room {r['label']}", value=f"Capacity: {len(r['occupants'])} / {r['capacity']}\nOccupants: {names_str}", inline=False)
+        pages.append(embed)
+        
+    if len(pages) == 1:
+        await interaction.response.send_message(embed=pages[0], ephemeral=True)
+    else:
+        view = RankingPaginationView(pages)
+        msg = await interaction.response.send_message(embed=pages[0], view=view, ephemeral=True)
+        view.message = msg
+
+@dorm_group.command(name="room_edit_capacity", description="Edit a room's capacity")
+@is_dev()
+async def dorm_room_edit_capacity(interaction: discord.Interaction, floor_label: str, room_label: str, new_capacity: int):
+    canon_floor = next((k for k in db["dorms"] if k.lower() == floor_label.lower()), None)
+    if not canon_floor: return await interaction.response.send_message(embed=get_embed("Not Found", "Floor not found.", COLOR_ERROR), ephemeral=True)
+    
+    canon_room = next((k for k in db["dorms"][canon_floor]["rooms"] if k.lower() == room_label.lower()), None)
+    if not canon_room: return await interaction.response.send_message(embed=get_embed("Not Found", "Room not found.", COLOR_ERROR), ephemeral=True)
+    
+    if new_capacity < 1 or new_capacity > 20: return await interaction.response.send_message(embed=get_embed("Invalid", "Must be 1-20.", COLOR_ERROR), ephemeral=True)
+    
+    room_data = db["dorms"][canon_floor]["rooms"][canon_room]
+    if new_capacity < len(room_data["occupants"]):
+        return await interaction.response.send_message(embed=get_embed("Capacity Error", f"Room currently has {len(room_data['occupants'])} occupants. Evict someone first.", COLOR_ERROR), ephemeral=True)
+        
+    room_data["capacity"] = new_capacity
+    save_db(db)
+    await interaction.response.send_message(embed=get_embed("Capacity Updated", f"Room {canon_room} on floor {canon_floor} is now capacity {new_capacity}.", COLOR_SUCCESS), ephemeral=True)
+
+@dorm_group.command(name="assign_manual", description="Manually assign an OC to a room")
+@is_dev()
+async def dorm_assign_manual(interaction: discord.Interaction, oc_name: str, floor_label: str, room_label: str):
+    oc = next((o for o in db["ocs"].values() if not o.get("eliminated", False) and o["name"].lower() == oc_name.lower()), None)
+    if not oc: return await interaction.response.send_message(embed=get_embed("Not Found", "Active OC not found.", COLOR_ERROR), ephemeral=True)
+    
+    canon_floor = next((k for k in db["dorms"] if k.lower() == floor_label.lower()), None)
+    if not canon_floor: return await interaction.response.send_message(embed=get_embed("Not Found", "Floor not found.", COLOR_ERROR), ephemeral=True)
+    
+    canon_room = next((k for k in db["dorms"][canon_floor]["rooms"] if k.lower() == room_label.lower()), None)
+    if not canon_room: return await interaction.response.send_message(embed=get_embed("Not Found", "Room not found.", COLOR_ERROR), ephemeral=True)
+    
+    room_data = db["dorms"][canon_floor]["rooms"][canon_room]
+    if len(room_data["occupants"]) >= room_data["capacity"]:
+        occ_names = [db["ocs"].get(oid, {}).get("name", "Unknown") for oid in room_data["occupants"]]
+        return await interaction.response.send_message(embed=get_embed("Room Full", f"Capacity {room_data['capacity']} reached.\nOccupants: {', '.join(occ_names)}", COLOR_ERROR), ephemeral=True)
+        
+    evict_msg = ""
+    if oc["dorm_floor"] and oc["dorm_room"]:
+        old_floor = db["dorms"].get(oc["dorm_floor"], {})
+        old_room = old_floor.get("rooms", {}).get(oc["dorm_room"], {})
+        if oc["id"] in old_room.get("occupants", []):
+            old_room["occupants"].remove(oc["id"])
+        evict_msg = f" (Evicted from {oc['dorm_floor']} - {oc['dorm_room']})"
+        
+    room_data["occupants"].append(oc["id"])
+    oc["dorm_floor"] = canon_floor
+    oc["dorm_room"] = canon_room
+    save_db(db)
+    
+    await interaction.response.send_message(embed=get_embed("Assigned", f"Assigned **{oc['name']}** to Floor {canon_floor}, Room {canon_room}.{evict_msg}", COLOR_SUCCESS), ephemeral=True)
+
+@dorm_group.command(name="assign_auto", description="Auto-assign all OCs to dorms")
+@is_dev()
+async def dorm_assign_auto(interaction: discord.Interaction, mode: str):
+    if mode.lower() not in ["rank", "grade", "random"]:
+        return await interaction.response.send_message(embed=get_embed("Invalid Mode", "Must be 'rank', 'grade', or 'random'.", COLOR_ERROR), ephemeral=True)
+        
+    recalculate_ranks()
+    
+    active_ocs = [oc for oc in db["ocs"].values() if not oc.get("eliminated", False)]
+    all_rooms = []
+    for f_label in sorted(db["dorms"].keys()):
+        for r_label in sorted(db["dorms"][f_label].get("rooms", {}).keys()):
+            all_rooms.append({"floor": f_label, "room": r_label, "data": db["dorms"][f_label]["rooms"][r_label]})
+            
+    total_slots = sum(r["data"]["capacity"] for r in all_rooms)
+    if total_slots < len(active_ocs):
+        await interaction.channel.send(embed=get_embed("⚠️ Slot Deficit", f"Only {total_slots} slots for {len(active_ocs)} OCs. Some will remain unassigned.", COLOR_WARNING))
+        
+    # Clear all assignments
+    for oc in active_ocs:
+        oc["dorm_floor"] = None
+        oc["dorm_room"] = None
+    for r in all_rooms:
+        r["data"]["occupants"] = []
+        
+    # Sort
+    if mode.lower() == "rank":
+        active_ocs.sort(key=lambda x: x["rank"])
+    elif mode.lower() == "random":
+        random.shuffle(active_ocs)
+    elif mode.lower() == "grade":
+        def grade_sort_key(oc):
+            g = oc.get("grade")
+            return (0, g.lower(), oc["rank"]) if g else (1, "", oc["rank"])
+        active_ocs.sort(key=grade_sort_key)
+        
+    # Assign
+    assigned_count = 0
+    room_idx = 0
+    
+    for oc in active_ocs:
+        # Find next room with space
+        while room_idx < len(all_rooms) and len(all_rooms[room_idx]["data"]["occupants"]) >= all_rooms[room_idx]["data"]["capacity"]:
+            room_idx += 1
+            
+        if room_idx >= len(all_rooms):
+            break # out of slots
+            
+        r = all_rooms[room_idx]
+        r["data"]["occupants"].append(oc["id"])
+        oc["dorm_floor"] = r["floor"]
+        oc["dorm_room"] = r["room"]
+        assigned_count += 1
+        
+    save_db(db)
+    
+    unassigned = [oc["name"] for oc in active_ocs if not oc["dorm_floor"]]
+    
+    embed = get_embed("Auto-Assignment Complete", f"Mode: **{mode}**\nAssigned: {assigned_count}\nUnassigned: {len(unassigned)}", COLOR_SUCCESS)
+    
+    for f_label in sorted(db["dorms"].keys()):
+        f_rooms = db["dorms"][f_label].get("rooms", {})
+        if not f_rooms: continue
+        desc = ""
+        for r_label, r_data in f_rooms.items():
+            occ_names = [db["ocs"].get(oid, {}).get("name", "Unknown") for oid in r_data["occupants"]]
+            if occ_names:
+                desc += f"**{r_label}**: {', '.join(occ_names)}\n"
+        if desc:
+            embed.add_field(name=f"Floor {f_label}", value=desc[:1024], inline=False)
+            
+    if unassigned:
+        embed.add_field(name="⚠️ Unassigned OCs", value=", ".join(unassigned)[:1024], inline=False)
+        
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+@dorm_group.command(name="assign_evict", description="Evict an OC from their room")
+@is_dev()
+async def dorm_assign_evict(interaction: discord.Interaction, oc_name: str):
+    oc = next((o for o in db["ocs"].values() if o["name"].lower() == oc_name.lower()), None)
+    if not oc: return await interaction.response.send_message(embed=get_embed("Not Found", "OC not found.", COLOR_ERROR), ephemeral=True)
+    
+    if not oc["dorm_floor"] or not oc["dorm_room"]:
+        return await interaction.response.send_message(embed=get_embed("Not Assigned", f"{oc['name']} is not in a dorm.", COLOR_WARNING), ephemeral=True)
+        
+    old_floor = db["dorms"].get(oc["dorm_floor"], {})
+    old_room = old_floor.get("rooms", {}).get(oc["dorm_room"], {})
+    if oc["id"] in old_room.get("occupants", []):
+        old_room["occupants"].remove(oc["id"])
+        
+    floor = oc["dorm_floor"]
+    room = oc["dorm_room"]
+    oc["dorm_floor"] = None
+    oc["dorm_room"] = None
+    save_db(db)
+    
+    await interaction.response.send_message(embed=get_embed("Evicted", f"Evicted {oc['name']} from {floor} - {room}.", COLOR_SUCCESS), ephemeral=True)
+
+@dorm_group.command(name="reset", description="Reset dorm assignments or structure")
+@is_dev()
+async def dorm_reset(interaction: discord.Interaction, mode: str):
+    if mode.lower() not in ["unassign_all", "nuke"]:
+        return await interaction.response.send_message(embed=get_embed("Invalid Mode", "Must be 'unassign_all' or 'nuke'.", COLOR_ERROR), ephemeral=True)
+        
+    if mode.lower() == "nuke":
+        await interaction.response.send_modal(DormNukeModal())
+    else:
+        view = DormResetConfirmView()
+        await interaction.response.send_message(
+            embed=get_embed("⚠️ Confirm Unassign All", "This will evict all OCs from all rooms but keep the floor/room structure intact. Confirm?", COLOR_WARNING),
+            view=view, ephemeral=True
+        )
+        view.message = await interaction.original_response()
+
 bot.tree.add_command(rank_group)
 bot.tree.add_command(config_group)
+bot.tree.add_command(grade_group)
+bot.tree.add_command(dorm_group)
 
 @bot.tree.command(name="export", description="[DEV] Export bot data to TSV")
 @is_dev()
@@ -930,6 +1469,22 @@ async def export_data(interaction: discord.Interaction):
         oc_name = db["ocs"].get(oc_id, db["archived_ocs"].get(oc_id, {"name": "Unknown"}))["name"]
         for idx, post in enumerate(posts, start=1):
             writer.writerow([oc_name, idx, post["post_id"], post["author_name"], post["like_count"], post.get("thread_id") or "", len(post["media_urls"]), post["created_at"]])
+
+    output.write("\n")
+    writer.writerow(["=== SECTION 7: DORM STRUCTURE ==="])
+    writer.writerow(["floor_label", "room_label", "capacity", "occupancy", "occupant_names", "created_at"])
+    # Note: the oc_data references naturally reflect the cleared state since they read from db["ocs"].
+    for floor_label, floor_data in db.get("dorms", {}).items():
+        for room_label, room_data in floor_data.get("rooms", {}).items():
+            occupant_names = ", ".join(
+                db["ocs"].get(oid, db["archived_ocs"].get(oid, {"name": "Unknown"}))["name"]
+                for oid in room_data.get("occupants", [])
+            )
+            writer.writerow([
+                floor_label, room_label, room_data.get("capacity", "?"),
+                len(room_data.get("occupants", [])), occupant_names,
+                room_data.get("created_at", "")
+            ])
 
     output.seek(0)
     file = discord.File(fp=io.BytesIO(output.getvalue().encode('utf-8')), filename=f"rankings_export_{get_now().strftime('%Y-%m-%d_%H-%M')}.tsv")
