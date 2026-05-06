@@ -21,6 +21,8 @@ import copy
 DATA_FILE = "data.json"
 TEMP_FILE = "data.tmp"
 
+_data_channel_lock = asyncio.Lock()
+
 POINTLOG_ACTION_RESETALL = "resetall"
 SNAP_TRIGGER_RESETALL = "POINTS_RESETALL_BASELINE"
 
@@ -65,7 +67,7 @@ HELP_SECTIONS = {
             ("/profile", "oc_name", "View a Trainee's full profile card."),
             ("/oc_all", "", "Browse all currently active Trainees (paginated)."),
             ("/oc_eliminated", "", "View all eliminated Trainees."),
-            ("/removeoc", "oc_name", "Permanently archive one of your own Trainees."),
+            ("/removeoc", "oc_name", "Permanently archive one of your own Trainees. Requires confirmation."),
         ],
         "dev_commands": [
             ("/deleteoc", "oc_name", "🔒 Permanently hard-delete an OC from all data (active or archived). Irreversible."),
@@ -74,14 +76,14 @@ HELP_SECTIONS = {
     "voting": {
         "title": "🗳️ Voting",
         "commands": [
-            ("/vote", "oc_names", "Vote for one or more Trainees (comma-separated). Subject to the per-round vote cap."),
+            ("/vote", "oc_names", "Vote for one or more Trainees (comma-separated). Subject to the per-day vote cap."),
             ("/votingstatus", "", "Check whether voting is currently open and see the current tally (if permitted)."),
         ],
         "dev_commands": [
-            ("/votingopen", "", "🔒 Open a new voting round and clear the previous vote ledger."),
-            ("/votingclose", "", "🔒 Close voting, apply the multiplier, tally votes, update rankings, and post to the announcement channel."),
+            ("/votingopen", "", "🔒 Open a new voting round immediately, or schedule it for a specific KST datetime (year/month/day hour/minute)."),
+            ("/votingclose", "", "🔒 Close voting immediately or schedule it. Applies the multiplier, tallies votes, and updates rankings."),
             ("/config votingmultiplier", "value", "🔒 Set the vote-to-points multiplier."),
-            ("/config votingcap", "cap", "🔒 Set the maximum number of votes per user per round (0 = unlimited)."),
+            ("/config votingcap", "cap", "🔒 Set max votes per user **per day** (resets 12:00 AM KST). 0 = unlimited."),
         ]
     },
     "points": {
@@ -210,7 +212,11 @@ DEFAULT_SCHEMA = {
         "cap": 0,
         "votes": {},
         "user_votes": {},
-        "last_closed_at": None
+        "last_closed_at": None,
+        "scheduled_open_time": None,
+        "scheduled_close_time": None,
+        "daily_vote_counts": {},
+        "daily_vote_date": None
     },
     "feeds": {},
     "dorms": {},
@@ -253,6 +259,18 @@ def load_data():
                 modified = True
             if "user_votes" not in data["voting"]:
                 data["voting"]["user_votes"] = {}
+                modified = True
+            if "scheduled_open_time" not in data["voting"]:
+                data["voting"]["scheduled_open_time"] = None
+                modified = True
+            if "scheduled_close_time" not in data["voting"]:
+                data["voting"]["scheduled_close_time"] = None
+                modified = True
+            if "daily_vote_counts" not in data["voting"]:
+                data["voting"]["daily_vote_counts"] = {}
+                modified = True
+            if "daily_vote_date" not in data["voting"]:
+                data["voting"]["daily_vote_date"] = None
                 modified = True
             
             # Feeds initialization
@@ -331,23 +349,30 @@ def save_data(data: dict, reason: str = "routine update", actor: discord.User | 
         pass  # No running event loop (e.g. called during synchronous startup)
 
 async def notify_data_channel(data: dict, reason: str, actor: discord.User | discord.Member | None = None):
-    channel_id = data["config"].get("data_channel_id")
-    if not channel_id:
-        return
-    try:
-        channel = bot.get_channel(int(channel_id))
-        if not channel:
+    async with _data_channel_lock:
+        channel_id = data["config"].get("data_channel_id")
+        if not channel_id:
             return
+        try:
+            channel = bot.get_channel(int(channel_id))
+            if not channel:
+                return
+                
+            embed = discord.Embed(title="📋 Data Updated", color=COLORS["neutral"])
+            embed.add_field(name="Reason", value=reason, inline=True)
+            embed.add_field(name="Actor", value=actor.mention if actor else "System", inline=True)
+            embed.add_field(name="Time", value=now().strftime("%Y-%m-%d %H:%M:%S %Z"), inline=False)
+            embed.set_footer(text="data.json written")
             
-        embed = discord.Embed(title="📋 Data Updated", color=COLORS["neutral"])
-        embed.add_field(name="Reason", value=reason, inline=True)
-        embed.add_field(name="Actor", value=actor.mention if actor else "System", inline=True)
-        embed.add_field(name="Time", value=now().strftime("%Y-%m-%d %H:%M:%S %Z"), inline=False)
-        embed.set_footer(text="data.json written")
-        
-        await channel.send(embed=embed)
-    except Exception:
-        pass
+            json_bytes = json.dumps(data, indent=4, ensure_ascii=False).encode("utf-8")
+            timestamp_str = now().strftime("%Y-%m-%d_%H-%M-%S")
+            safe_reason = re.sub(r'[^a-zA-Z0-9_\-]', '_', reason)[:40]
+            filename = f"data_{timestamp_str}_{safe_reason}.json"
+            data_file = discord.File(fp=io.BytesIO(json_bytes), filename=filename)
+            
+            await channel.send(embed=embed, file=data_file)
+        except Exception:
+            pass
 
 async def ensure_grade_role(guild: discord.Guild, grade_label: str, hex_color: str, data: dict) -> discord.Role | None:
     color_int = hex_to_int(hex_color)
@@ -419,6 +444,20 @@ def today_kst() -> datetime.date:
     """Return the current calendar date in Korean Standard Time (UTC+9)."""
     return datetime.now(KST).date()
 
+def _reset_daily_votes_if_needed(data: dict) -> bool:
+    """
+    Check if the current KST date differs from the stored daily_vote_date.
+    If so, reset daily_vote_counts and update daily_vote_date.
+    Returns True if a reset occurred (caller should save data), False otherwise.
+    """
+    today_str = today_kst().isoformat()
+    stored_date = data["voting"].get("daily_vote_date")
+    if stored_date != today_str:
+        data["voting"]["daily_vote_counts"] = {}
+        data["voting"]["daily_vote_date"] = today_str
+        return True
+    return False
+
 def format_dt(dt_str):
     if not dt_str: return "Unknown"
     dt = datetime.fromisoformat(dt_str).astimezone(get_tz())
@@ -476,12 +515,10 @@ def is_dev():
 def recalculate_ranks(data):
     active_ocs = [oc for oc in data["ocs"].values() if not oc.get("eliminated", False)]
     if not active_ocs:
-        save_data(data)
         return
     active_ocs.sort(key=lambda x: (-x["total_points"], x["registered_at"]))
     for rank, oc in enumerate(active_ocs, start=1):
         data["ocs"][oc["id"]]["current_rank"] = rank
-    save_data(data)
 
 def find_oc(name: str, data: dict):
     name_lower = name.lower()
@@ -599,7 +636,7 @@ class ConfirmResetView(discord.ui.View):
             "rankings":  snap_data
         })
 
-        save_data(data)
+        save_data(data, reason="points_reset_all", actor=interaction.user)
 
         await interaction.response.edit_message(
             embed=get_embed(
@@ -643,7 +680,7 @@ class ConfirmPurgeView(discord.ui.View):
     async def confirm_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self._disable_all()
         # Perform atomic reset: overwrite data.json with DEFAULT_SCHEMA
-        save_data(copy.deepcopy(DEFAULT_SCHEMA))
+        save_data(copy.deepcopy(DEFAULT_SCHEMA), reason="data_purged", actor=interaction.user)
         await interaction.response.edit_message(
             embed=get_embed(
                 "🗑️ All Data Wiped",
@@ -783,11 +820,11 @@ class ConfirmDeleteOCView(discord.ui.View):
                 data=data
             )
             
-        save_data(data, reason=f"hard-delete OC: {self.oc_name}", actor=self.actor)
-        
         if not self.came_from_archive:
             recalculate_ranks(data)
             
+        save_data(data, reason=f"OC hard-deleted: {self.oc_name}", actor=self.actor)
+        
         desc = "\n".join(f"• {line}" for line in purged_summary)
         await interaction.response.edit_message(
             embed=get_embed("🗑️ OC Hard-Deleted", f"Successfully and permanently deleted **{self.oc_name}**.\n\n**Cleanup Summary:**\n{desc}", "success"), 
@@ -805,6 +842,70 @@ class ConfirmDeleteOCView(discord.ui.View):
     async def on_timeout(self):
         await self._disable_all()
 
+class ConfirmRemoveOCView(discord.ui.View):
+    def __init__(self, oc_id: str, oc_name: str, actor: discord.Member):
+        super().__init__(timeout=45)
+        self.oc_id = oc_id
+        self.oc_name = oc_name
+        self.actor = actor
+        self.message: discord.Message = None
+
+    async def _disable_all(self):
+        for item in self.children:
+            item.disabled = True
+        if self.message:
+            try:
+                await self.message.edit(view=self)
+            except discord.NotFound:
+                pass
+
+    @discord.ui.button(label="🗑️ Yes, Archive", style=discord.ButtonStyle.danger)
+    async def confirm_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._disable_all()
+        data = load_data()
+        
+        oc = data["ocs"].get(self.oc_id)
+        if not oc:
+            return await interaction.response.edit_message(embed=get_embed("Error", "OC not found in active roster.", "error"), view=self)
+        if oc["owner_id"] != str(interaction.user.id):
+            return await interaction.response.edit_message(embed=get_embed("Permission Denied", "You don't own this OC.", "error"), view=self)
+            
+        if oc.get("dorm_floor") and oc.get("dorm_room"):
+            try:
+                data["dorms"][oc["dorm_floor"]]["rooms"][oc["dorm_room"]]["occupants"].remove(oc["id"])
+            except ValueError:
+                pass
+        
+        data["archived_ocs"][oc["id"]] = oc
+        del data["ocs"][oc["id"]]
+        recalculate_ranks(data)
+        
+        if interaction.guild:
+            await sync_grade_role_for_owner(
+                interaction.guild,
+                oc["owner_id"],
+                new_grade_label=None,
+                old_grade_label=oc.get("grade"),
+                data=data
+            )
+            
+        save_data(data, reason=f"OC archived: {self.oc_name}", actor=self.actor)
+        
+        await interaction.response.edit_message(
+            embed=get_embed("OC Archived", f"**{self.oc_name}** has been archived and removed from the active roster. Take care! 👋", "success"),
+            view=self
+        )
+
+    @discord.ui.button(label="✖ Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._disable_all()
+        await interaction.response.edit_message(
+            embed=get_embed("Cancelled", "Archive cancelled. The OC was not modified.", "system"), 
+            view=self
+        )
+
+    async def on_timeout(self):
+        await self._disable_all()
 
 class FeedPostView(discord.ui.View):
     """
@@ -1206,16 +1307,16 @@ class ConfigCog(commands.Cog):
     async def votingmultiplier(self, interaction: discord.Interaction, value: int):
         data = load_data()
         data["voting"]["multiplier"] = value
-        save_data(data)
+        save_data(data, reason="config_multiplier_updated", actor=interaction.user)
         await interaction.response.send_message(embed=get_embed("Success", f"Voting multiplier set to {value}.", "success"), ephemeral=True)
 
-    @config_group.command(name="votingcap", description="[DEV] Set the maximum number of votes per user per round")
-    @app_commands.describe(cap="Maximum votes per user per round. Set to 0 to allow unlimited votes.")
+    @config_group.command(name="votingcap", description="[DEV] Set max votes per user **per day** (resets 12:00 AM KST). 0 = unlimited.")
+    @app_commands.describe(cap="Maximum votes per user per day. Set to 0 to allow unlimited votes.")
     @is_dev()
     async def votingcap(self, interaction: discord.Interaction, cap: int):
         data = load_data()
         data["voting"]["cap"] = cap
-        save_data(data)
+        save_data(data, reason="config_votingcap_updated", actor=interaction.user)
         await interaction.response.send_message(embed=get_embed("Success", f"Voting cap set to {cap}.", "success"), ephemeral=True)
 
     @app_commands.command(name="purgedata", description="[DEV] ⚠️ Permanently wipe ALL bot data and reset to defaults")
@@ -1316,6 +1417,7 @@ class RegistrationCog(commands.Cog):
         }
         data["ocs"][oc_id] = new_oc
         recalculate_ranks(data)
+        save_data(data, reason="oc_registered", actor=interaction.user)
         
         embed = self._build_profile_embed(new_oc, data)
         await interaction.followup.send(content="🎉 Welcome to the show! Your Trainee has been registered. Here's their profile:", embed=embed)
@@ -1329,37 +1431,22 @@ class RegistrationCog(commands.Cog):
             return await interaction.response.send_message(embed=get_embed("Not Found", f"We looked everywhere but couldn't find a Trainee named '{oc_name}'.", "error"), ephemeral=True)
         await interaction.response.send_message(embed=self._build_profile_embed(oc, data))
 
-    @app_commands.command(name="removeoc", description="Archive a Trainee (Irreversible)")
+    @app_commands.command(name="removeoc", description="Permanently archive one of your own Trainees. Requires confirmation.")
     @app_commands.describe(oc_name="The name of your Trainee OC to permanently archive. This action cannot be undone.")
     async def removeoc(self, interaction: discord.Interaction, oc_name: str):
-        await interaction.response.defer(ephemeral=True)
         data = load_data()
         oc = find_oc(oc_name, data)
         if not oc or oc["owner_id"] != str(interaction.user.id):
-            return await interaction.followup.send(embed=get_embed("Error", "Hmm, we couldn't find that Trainee in your roster. Double-check the name and try again!", "error"))
+            return await interaction.response.send_message(embed=get_embed("Error", "Hmm, we couldn't find that Trainee in your roster. Double-check the name and try again!", "error"), ephemeral=True)
         
-        if oc.get("dorm_floor") and oc.get("dorm_room"):
-            try:
-                data["dorms"][oc["dorm_floor"]]["rooms"][oc["dorm_room"]]["occupants"].remove(oc["id"])
-            except ValueError:
-                pass
-        
-        data["archived_ocs"][oc["id"]] = oc
-        del data["ocs"][oc["id"]]
-        recalculate_ranks(data)
-        
-        if interaction.guild:
-            await sync_grade_role_for_owner(
-                interaction.guild,
-                oc["owner_id"],
-                new_grade_label=None,
-                old_grade_label=oc.get("grade"),
-                data=data
-            )
-            
-        save_data(data, reason=f"OC archived: {oc_name}", actor=interaction.user)
-        
-        await interaction.followup.send(embed=get_embed("OC Archived", f"**{oc_name}** has been archived and removed from the active roster. Take care! 👋", "success"))
+        view = ConfirmRemoveOCView(oc["id"], oc["name"], interaction.user)
+        embed = get_embed(
+            "⚠️ Confirm Archive",
+            f"You are about to permanently archive **{oc['name']}**. They will be removed from the active roster, dorms, and rankings.\n\nThis **cannot be undone**. Click Confirm to proceed.",
+            "warning"
+        )
+        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+        view.message = await interaction.original_response()
 
     @app_commands.command(name="deleteoc", description="[DEV] Permanently and irreversibly delete an OC from all data")
     @app_commands.describe(oc_name="The name of the OC to permanently purge. Searches active and archived OCs.")
@@ -1522,6 +1609,7 @@ class RegistrationCog(commands.Cog):
                 oc["dorm_room"] = None
                 
         recalculate_ranks(data)
+        save_data(data, reason="ocs_eliminated", actor=interaction.user)
         
         if mode.value == "name":
             embed_announce = get_embed("A Trainee Has Been Eliminated", f"*{names[0]} has been eliminated from the competition.*", "warning")
@@ -1593,30 +1681,28 @@ class VotingCog(commands.Cog):
                 ephemeral=True
             )
 
-        user_id   = str(interaction.user.id)
-        cap       = data["voting"]["cap"]           # 0 = unlimited
+        user_id = str(interaction.user.id)
+        cap = data["voting"]["cap"]  # 0 = unlimited
 
-        # Count how many votes this user has already cast this round
-        votes_already_cast = sum(
-            v_list.count(user_id)
-            for v_list in data["voting"]["votes"].values()
-        )
+        _reset_daily_votes_if_needed(data)
 
-        # Remaining quota (None = unlimited)
-        remaining = (cap - votes_already_cast) if cap > 0 else None
+        daily_counts = data["voting"]["daily_vote_counts"]
+        votes_today = daily_counts.get(user_id, 0)
 
-        # If cap is set and already exhausted, short-circuit immediately
+        # Remaining daily quota (None = unlimited)
+        remaining = (cap - votes_today) if cap > 0 else None
+
         if remaining is not None and remaining <= 0:
             return await interaction.response.send_message(
                 embed=get_embed(
-                    "Cap Reached",
-                    "You've used up all your votes for this round! Check back when the next round opens. ✨",
+                    "Daily Cap Reached",
+                    f"You've used all **{cap}** of your votes for today! "
+                    f"Your votes reset at **12:00 AM KST**. Come back then! 🗓️",
                     "error"
                 ),
                 ephemeral=True
             )
 
-        # Parse the input into individual name tokens
         raw_names = [n.strip() for n in oc_names.split(",") if n.strip()]
 
         if not raw_names:
@@ -1629,41 +1715,36 @@ class VotingCog(commands.Cog):
         rejected  = []   # list of (name_token, reason_string) tuples
 
         for token in raw_names:
-            # Check remaining quota before processing each token
             if remaining is not None and remaining <= 0:
                 rejected.append((token, f"Vote cap of **{cap}** reached mid-batch"))
                 continue
 
-            # OC resolution
             oc = find_oc(token, data)
             if not oc:
                 rejected.append((token, "Hmm, we couldn't find a Trainee with that name. Check the spelling and try again!"))
                 continue
 
-            # Eligibility check
             if oc.get("eliminated", False):
                 rejected.append((token, f"**{oc['name']}** has been eliminated"))
                 continue
 
-            # Record the vote
             if oc["id"] not in data["voting"]["votes"]:
                 data["voting"]["votes"][oc["id"]] = []
             data["voting"]["votes"][oc["id"]].append(user_id)
 
+            daily_counts[user_id] = daily_counts.get(user_id, 0) + 1
             accepted.append(oc["name"])
             if remaining is not None:
                 remaining -= 1
 
-        # Persist only if at least one vote was accepted
         if accepted:
-            save_data(data)
+            save_data(data, reason="votes_cast", actor=interaction.user)
 
-        # Build response embed
-        votes_now_cast = votes_already_cast + len(accepted)
+        votes_today_final = daily_counts.get(user_id, 0)
         quota_line = (
-            f"**Quota**: {votes_now_cast}/{cap} vote(s) used this round."
+            f"**Today's Quota**: {votes_today_final}/{cap} vote(s) used today (resets 12:00 AM KST)."
             if cap > 0 else
-            f"**Votes cast this round** (no cap): {votes_now_cast}"
+            f"**Votes cast today** (no cap): {votes_today_final}"
         )
 
         if accepted and not rejected:
@@ -1688,64 +1769,157 @@ class VotingCog(commands.Cog):
             ephemeral=True
         )
 
-    @app_commands.command(name="votingopen", description="Open a voting round immediately (Dev only)")
+    @app_commands.command(name="votingopen", description="🔒 Open a new voting round immediately, or schedule it for a specific KST datetime (year/month/day hour/minute).")
+    @app_commands.describe(
+        year="(Optional) Year to open voting. If omitted, opens immediately.",
+        month="(Optional) Month (1–12).",
+        day="(Optional) Day (1–31).",
+        hour="(Optional) Hour in 24-hour KST (0–23). Defaults to 0 if date is given.",
+        minute="(Optional) Minute (0–59). Defaults to 0 if date is given."
+    )
     @is_dev()
-    async def votingopen(self, interaction: discord.Interaction):
+    async def votingopen(self, interaction: discord.Interaction, year: int = None, month: int = None, day: int = None, hour: int = 0, minute: int = 0):
         data = load_data()
-        data["voting"]["is_open"] = True
-        data["voting"]["votes"] = {}
-        data["voting"]["start_time"] = now().isoformat()
-        save_data(data)
-        await interaction.response.send_message(embed=get_embed("Voting Opened", "🗳️ Voting is now open! Members can start casting their votes.", "success"))
+        
+        date_args = [year, month, day]
+        if any(a is None for a in date_args) and not all(a is None for a in date_args):
+            return await interaction.response.send_message(embed=get_embed("Error", "Provide all of year, month, and day together, or omit all to open immediately.", "error"), ephemeral=True)
+            
+        if all(a is None for a in date_args):
+            data["voting"]["is_open"] = True
+            data["voting"]["votes"] = {}
+            data["voting"]["user_votes"] = {}
+            data["voting"]["daily_vote_counts"] = {}
+            data["voting"]["daily_vote_date"] = today_kst().isoformat()
+            data["voting"]["start_time"] = now().isoformat()
+            data["voting"]["scheduled_open_time"] = None
+            save_data(data, reason="voting_opened", actor=interaction.user)
+            await interaction.response.send_message(embed=get_embed("Voting Opened", "🗳️ Voting is now open! Members can start casting their votes.", "success"))
+        else:
+            try:
+                target_dt = datetime(year, month, day, hour, minute, tzinfo=KST)
+            except ValueError as e:
+                return await interaction.response.send_message(embed=get_embed("Error", f"Invalid date/time: {e}", "error"), ephemeral=True)
+                
+            if target_dt <= datetime.now(KST):
+                return await interaction.response.send_message(embed=get_embed("Warning", "That time is in the past. Provide a future time or omit parameters to open immediately.", "warning"), ephemeral=True)
+                
+            data["voting"]["scheduled_open_time"] = target_dt.isoformat()
+            save_data(data, reason="voting_open_scheduled", actor=interaction.user)
+            await interaction.response.send_message(embed=get_embed("Voting Scheduled", f"✅ Voting is scheduled to open on **{target_dt.strftime('%Y/%m/%d %H:%M KST')}**.", "success"), ephemeral=True)
 
-    @app_commands.command(name="votingclose", description="Close voting, apply multiplier & tally (Dev only)")
+    @app_commands.command(name="votingclose", description="🔒 Close voting immediately or schedule it. Applies the multiplier, tallies votes, and updates rankings.")
+    @app_commands.describe(
+        year="(Optional) Year to close voting. If omitted, closes immediately.",
+        month="(Optional) Month (1–12).",
+        day="(Optional) Day (1–31).",
+        hour="(Optional) Hour in 24-hour KST (0–23). Defaults to 0 if date is given.",
+        minute="(Optional) Minute (0–59). Defaults to 0 if date is given."
+    )
     @is_dev()
-    async def votingclose(self, interaction: discord.Interaction):
-        await interaction.response.defer()
+    async def votingclose(self, interaction: discord.Interaction, year: int = None, month: int = None, day: int = None, hour: int = 0, minute: int = 0):
         data = load_data()
-        data["voting"]["is_open"] = False
-        data["voting"]["last_closed_at"] = now().isoformat()
-        data["voting"]["end_time"] = now().isoformat()
         
-        mult = data["voting"]["multiplier"]
-        for oc_id, voters in data["voting"]["votes"].items():
-            if oc_id in data["ocs"] and not data["ocs"][oc_id].get("eliminated", False):
-                pts = len(voters) * mult
-                points_before = data["ocs"][oc_id]["total_points"]
+        date_args = [year, month, day]
+        if any(a is None for a in date_args) and not all(a is None for a in date_args):
+            return await interaction.response.send_message(embed=get_embed("Error", "Provide all of year, month, and day together, or omit all to close immediately.", "error"), ephemeral=True)
+            
+        if all(a is None for a in date_args):
+            await interaction.response.defer()
+            data["voting"]["is_open"] = False
+            data["voting"]["last_closed_at"] = now().isoformat()
+            data["voting"]["end_time"] = now().isoformat()
+            data["voting"]["scheduled_close_time"] = None
+            
+            mult = data["voting"]["multiplier"]
+            for oc_id, voters in data["voting"]["votes"].items():
+                if oc_id in data["ocs"] and not data["ocs"][oc_id].get("eliminated", False):
+                    pts = len(voters) * mult
+                    points_before = data["ocs"][oc_id]["total_points"]
+                    
+                    data["ocs"][oc_id]["voting_points"] += pts
+                    data["ocs"][oc_id]["total_points"] += pts
+                    
+                    data["point_log"].append({
+                        "timestamp": now().isoformat(),
+                        "dev_id": str(interaction.user.id),
+                        "dev_name": interaction.user.name,
+                        "oc_id": oc_id,
+                        "oc_name": data["ocs"][oc_id]["name"],
+                        "action": "vote_close",
+                        "value": pts,
+                        "points_before": points_before,
+                        "points_after": data["ocs"][oc_id]["total_points"]
+                    })
+            
+            recalculate_ranks(data)
+            
+            active_ocs = [oc for oc in data["ocs"].values() if not oc.get("eliminated", False)]
+            snapshot = {
+                "timestamp": now().isoformat(),
+                "trigger": "VOTING_ROUND_CLOSE",
+                "rankings": [{"oc_id": oc["id"], "rank": oc["current_rank"], "points": oc["total_points"]} for oc in active_ocs]
+            }
+            data["rank_snapshots"].append(snapshot)
+            save_data(data, reason="voting_closed", actor=interaction.user)
+            
+            channel_id = data["config"]["announcement_channel_id"]
+            if channel_id:
+                channel = self.bot.get_channel(int(channel_id))
+                if channel:
+                    embed = get_embed("Voting Closed", "✅ Voting has closed! Results have been tallied and rankings are updated.", "system", show_footer=True)
+                    await channel.send(embed=embed)
+            
+            await interaction.followup.send(embed=get_embed("Success", "✅ Voting has closed! Results have been tallied and rankings are updated.", "success"))
+        else:
+            try:
+                target_dt = datetime(year, month, day, hour, minute, tzinfo=KST)
+            except ValueError as e:
+                return await interaction.response.send_message(embed=get_embed("Error", f"Invalid date/time: {e}", "error"), ephemeral=True)
                 
-                data["ocs"][oc_id]["voting_points"] += pts
-                data["ocs"][oc_id]["total_points"] += pts
+            if target_dt <= datetime.now(KST):
+                return await interaction.response.send_message(embed=get_embed("Warning", "That time is in the past. Provide a future time or omit parameters to close immediately.", "warning"), ephemeral=True)
                 
-                data["point_log"].append({
-                    "timestamp": now().isoformat(),
-                    "dev_id": str(interaction.user.id),
-                    "dev_name": interaction.user.name,
-                    "oc_id": oc_id,
-                    "oc_name": data["ocs"][oc_id]["name"],
-                    "action": "vote_close",
-                    "value": pts,
-                    "points_before": points_before,
-                    "points_after": data["ocs"][oc_id]["total_points"]
-                })
+            if not data["voting"]["is_open"] and data["voting"].get("scheduled_open_time") is None:
+                return await interaction.response.send_message(embed=get_embed("Warning", "Voting is not open and no open is scheduled. Schedule or open voting first.", "warning"), ephemeral=True)
+                
+            data["voting"]["scheduled_close_time"] = target_dt.isoformat()
+            save_data(data, reason="voting_close_scheduled", actor=interaction.user)
+            await interaction.response.send_message(embed=get_embed("Voting Scheduled", f"✅ Voting is scheduled to close on **{target_dt.strftime('%Y/%m/%d %H:%M KST')}**.", "success"), ephemeral=True)
+
+    @app_commands.command(name="votingstatus", description="Check whether voting is currently open and see the current tally (if permitted).")
+    async def votingstatus(self, interaction: discord.Interaction):
+        data = load_data()
+        is_open = data["voting"]["is_open"]
+        cap = data["voting"]["cap"]
         
-        recalculate_ranks(data)
-        
-        active_ocs = [oc for oc in data["ocs"].values() if not oc.get("eliminated", False)]
-        snapshot = {
-            "timestamp": now().isoformat(),
-            "trigger": "VOTING_ROUND_CLOSE",
-            "rankings": [{"oc_id": oc["id"], "rank": oc["current_rank"], "points": oc["total_points"]} for oc in active_ocs]
-        }
-        data["rank_snapshots"].append(snapshot)
-        save_data(data)
-        
-        channel_id = data["config"]["announcement_channel_id"]
-        if channel_id:
-            channel = self.bot.get_channel(int(channel_id))
-            embed = get_embed("Voting Closed", "✅ Voting has closed! Results have been tallied and rankings are updated.", "system", show_footer=True)
-            await channel.send(embed=embed)
-        
-        await interaction.followup.send(embed=get_embed("Success", "✅ Voting has closed! Results have been tallied and rankings are updated.", "success"))
+        status_parts = []
+        if is_open:
+            status_parts.append("✅ **Voting is currently OPEN.**")
+        else:
+            status_parts.append("❌ **Voting is currently CLOSED.**")
+            
+        sched_open = data["voting"].get("scheduled_open_time")
+        sched_close = data["voting"].get("scheduled_close_time")
+
+        if sched_open:
+            dt = datetime.fromisoformat(sched_open)
+            status_parts.append(f"📅 **Scheduled to Open:** {dt.strftime('%Y/%m/%d %H:%M KST')}")
+        if sched_close:
+            dt = datetime.fromisoformat(sched_close)
+            status_parts.append(f"📅 **Scheduled to Close:** {dt.strftime('%Y/%m/%d %H:%M KST')}")
+            
+        if is_open and cap > 0:
+            user_id = str(interaction.user.id)
+            _reset_daily_votes_if_needed(data)
+            votes_today = data["voting"]["daily_vote_counts"].get(user_id, 0)
+            remaining = cap - votes_today
+            status_parts.append(
+                f"\n🗳️ **Your Daily Votes:** {votes_today}/{cap} used "
+                f"(~{remaining} remaining · resets 12:00 AM KST)"
+            )
+            
+        await interaction.response.send_message(embed=get_embed("Voting Status", "\n".join(status_parts), "neutral"), ephemeral=True)
 
 class PointsCog(commands.Cog):
     def __init__(self, bot):
@@ -1809,7 +1983,7 @@ class PointsCog(commands.Cog):
             "rankings": [{"oc_id": o["id"], "rank": o["current_rank"], "points": o["total_points"]} for o in active_ocs]
         }
         data["rank_snapshots"].append(snapshot)
-        save_data(data)
+        save_data(data, reason=f"points_{action.value}_{oc_name}", actor=interaction.user)
         
         await interaction.response.send_message(embed=get_embed("Points Updated", f"OC **{oc['name']}** total points updated from {points_before:,} to {oc['total_points']:,}.", "success"))
 
@@ -2551,6 +2725,7 @@ class PeerRankingCog(commands.Cog):
         session["penalty_applied_to"] = penalty_oc_id
         
         recalculate_ranks(data)
+        save_data(data, reason="peer_ranking_closed", actor=interaction.user)
         
         desc = (f"Ballots: {len(session['ballots'])} / {len(session['eligible_voter_ids'])}\n"
                 f"**⭐ Benefit**: {data['ocs'][benefit_oc_id]['name']} (+{bonus})\n"
@@ -2604,7 +2779,7 @@ class PeerRankingCog(commands.Cog):
         await announce_ch.send(embed=res_embed)
 
         session["revealed"] = True
-        save_data(data)
+        save_data(data, reason="peer_ranking_revealed", actor=interaction.user)
         await interaction.followup.send(embed=get_embed("Success", "All ballots have been publicly revealed.", "success"))
 
     @peerranking.command(name="status", description="Check current peer ranking status")
@@ -2663,7 +2838,7 @@ class RankingsCog(commands.Cog):
             "rankings": [{"oc_id": o["id"], "rank": o["current_rank"], "points": o["total_points"]} for o in ocs]
         }
         data["rank_snapshots"].append(snapshot)
-        save_data(data)
+        save_data(data, reason="rankings_private_snapshot", actor=interaction.user)
         
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
@@ -2767,7 +2942,7 @@ class ExportCog(commands.Cog):
             writer.writerow([
                 s["session_id"], group.get("name", "Unknown"), str(s["resolved"]),
                 str(s["revealed"]), s.get("closed_at") or "",
-                len(s["ballots"]), len(s["eligible_voter_ids"]),
+                len(s["ballots"]), len(s["eligible_voters"]),
                 benefit_name, penalty_name
             ])
 
@@ -2975,7 +3150,7 @@ class FeedCog(commands.Cog):
         
         data["feeds"][oc_id].append(post_record)
         oc.setdefault("feed_post_ids", []).append(post_id)
-        save_data(data)
+        save_data(data, reason="feed_post_created", actor=interaction.user)
         
         await interaction.followup.send(embed=get_embed("Post Published", f"📸 **{oc['name']}**'s post is live! Head over to <#{feed_ch.id}> to check it out.", "success"), ephemeral=True)
 
@@ -3066,7 +3241,7 @@ class FeedCog(commands.Cog):
             
         data["feeds"][oc["id"]].pop(post_number - 1)
         oc["feed_post_ids"].pop(post_number - 1)
-        save_data(data)
+        save_data(data, reason="feed_post_deleted", actor=interaction.user)
         
         await interaction.response.send_message(embed=get_embed("Post Deleted", f"Post #{post_number} from **{oc['name']}**'s feed has been taken down successfully.", "success"), ephemeral=True)
 
@@ -3075,7 +3250,93 @@ class FeedCog(commands.Cog):
 # ==========================================
 @tasks.loop(minutes=1)
 async def voting_scheduler():
-    pass
+    data = load_data()
+    now_kst = datetime.now(KST)
+    changed = False
+
+    # --- Daily vote count reset at 12:00 AM KST ---
+    if data["voting"]["is_open"]:
+        reset_occurred = _reset_daily_votes_if_needed(data)
+        if reset_occurred:
+            changed = True
+
+    # --- Scheduled open ---
+    sched_open = data["voting"].get("scheduled_open_time")
+    if sched_open and not data["voting"]["is_open"]:
+        target = datetime.fromisoformat(sched_open)
+        if now_kst >= target:
+            data["voting"]["is_open"] = True
+            data["voting"]["votes"] = {}
+            data["voting"]["user_votes"] = {}
+            data["voting"]["daily_vote_counts"] = {}
+            data["voting"]["daily_vote_date"] = today_kst().isoformat()
+            data["voting"]["start_time"] = now_kst.isoformat()
+            data["voting"]["scheduled_open_time"] = None
+            changed = True
+
+            ann_id = data["config"].get("announcement_channel_id")
+            if ann_id:
+                ch = bot.get_channel(int(ann_id))
+                if ch:
+                    await ch.send(embed=get_embed(
+                        "🗳️ Voting Is Now Open!",
+                        "The scheduled voting round has begun. Cast your votes!",
+                        "success",
+                        show_footer=True
+                    ))
+
+    # --- Scheduled close ---
+    sched_close = data["voting"].get("scheduled_close_time")
+    if sched_close and data["voting"]["is_open"]:
+        target = datetime.fromisoformat(sched_close)
+        if now_kst >= target:
+            data["voting"]["is_open"] = False
+            data["voting"]["last_closed_at"] = now_kst.isoformat()
+            data["voting"]["end_time"] = now_kst.isoformat()
+            data["voting"]["scheduled_close_time"] = None
+
+            mult = data["voting"]["multiplier"]
+            for oc_id, voters in data["voting"]["votes"].items():
+                if oc_id in data["ocs"] and not data["ocs"][oc_id].get("eliminated", False):
+                    pts = len(voters) * mult
+                    points_before = data["ocs"][oc_id]["total_points"]
+                    data["ocs"][oc_id]["voting_points"] += pts
+                    data["ocs"][oc_id]["total_points"] += pts
+                    data["point_log"].append({
+                        "timestamp": now_kst.isoformat(),
+                        "dev_id":    "SYSTEM_SCHEDULER",
+                        "dev_name":  "AutoScheduler",
+                        "oc_id":     oc_id,
+                        "oc_name":   data["ocs"][oc_id]["name"],
+                        "action":    "vote_close",
+                        "value":     pts,
+                        "points_before": points_before,
+                        "points_after":  data["ocs"][oc_id]["total_points"]
+                    })
+
+            recalculate_ranks(data)
+
+            active_ocs = [o for o in data["ocs"].values() if not o.get("eliminated", False)]
+            data["rank_snapshots"].append({
+                "timestamp": now_kst.isoformat(),
+                "trigger":   "SCHEDULED_VOTING_ROUND_CLOSE",
+                "rankings":  [{"oc_id": o["id"], "rank": o["current_rank"], "points": o["total_points"]} for o in active_ocs]
+            })
+            changed = True
+
+            ann_id = data["config"].get("announcement_channel_id")
+            if ann_id:
+                ch = bot.get_channel(int(ann_id))
+                if ch:
+                    await ch.send(embed=get_embed(
+                        "Voting Closed",
+                        "✅ The scheduled voting round has closed. Results have been tallied and rankings updated.",
+                        "system",
+                        show_footer=True
+                    ))
+
+    if changed:
+        save_data(data, reason="scheduler_auto_action")
 
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
