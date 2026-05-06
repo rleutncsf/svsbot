@@ -67,7 +67,9 @@ HELP_SECTIONS = {
             ("/oc_eliminated", "", "View all eliminated Trainees."),
             ("/removeoc", "oc_name", "Permanently archive one of your own Trainees."),
         ],
-        "dev_commands": []
+        "dev_commands": [
+            ("/deleteoc", "oc_name", "🔒 Permanently hard-delete an OC from all data (active or archived). Irreversible."),
+        ]
     },
     "voting": {
         "title": "🗳️ Voting",
@@ -161,6 +163,7 @@ HELP_SECTIONS = {
             ("/setassetchannel", "channel", "🔒 Set the persistent asset storage channel."),
             ("/setfeedchannel", "channel", "🔒 Set the public feed channel."),
             ("/setbackupchannel", "channel", "🔒 Set the designated channel for JSON backups."),
+            ("/setdatachannel", "channel", "🔒 Set the channel that receives automatic data-change notifications."),
             ("/backup", "", "🔒 Export the full data.json to the backup channel. Creates the channel automatically if it doesn't exist."),
             ("/setrevealpage", "size", "🔒 Set how many Trainees appear per reveal page (1–25)."),
             ("/config setdebutslots", "slots [public]", "🔒 Mark the top N ranking positions as the debut line."),
@@ -181,6 +184,7 @@ DEFAULT_SCHEMA = {
         "asset_channel": None,
         "feed_channel": None,
         "backup_channel_id": None,
+        "data_channel_id": None,
         "reveal_page_size": 7,
         "debut_slots": 0,
         "debut_slots_public": True,
@@ -301,6 +305,12 @@ def load_data():
                     if "channel_id" not in room_data:
                         room_data["channel_id"] = None
                         modified = True
+                        
+            # Schema Migration Guard for Grades: add role_id
+            for grade_label, grade_data in data.get("grades", {}).items():
+                if "role_id" not in grade_data:
+                    grade_data["role_id"] = None
+                    modified = True
 
             if modified:
                 save_data(data)
@@ -309,10 +319,87 @@ def load_data():
         print("CRITICAL ERROR: JSON is malformed. Halting to prevent data overwrite.")
         os._exit(1)
 
-def save_data(data):
+def save_data(data: dict, reason: str = "routine update", actor: discord.User | discord.Member | None = None):
     with open(TEMP_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=4)
     os.replace(TEMP_FILE, DATA_FILE)
+    
+    try:
+        loop = asyncio.get_running_loop()
+        loop.create_task(notify_data_channel(data, reason, actor))
+    except RuntimeError:
+        pass  # No running event loop (e.g. called during synchronous startup)
+
+async def notify_data_channel(data: dict, reason: str, actor: discord.User | discord.Member | None = None):
+    channel_id = data["config"].get("data_channel_id")
+    if not channel_id:
+        return
+    try:
+        channel = bot.get_channel(int(channel_id))
+        if not channel:
+            return
+            
+        embed = discord.Embed(title="📋 Data Updated", color=COLORS["neutral"])
+        embed.add_field(name="Reason", value=reason, inline=True)
+        embed.add_field(name="Actor", value=actor.mention if actor else "System", inline=True)
+        embed.add_field(name="Time", value=now().strftime("%Y-%m-%d %H:%M:%S %Z"), inline=False)
+        embed.set_footer(text="data.json written")
+        
+        await channel.send(embed=embed)
+    except Exception:
+        pass
+
+async def ensure_grade_role(guild: discord.Guild, grade_label: str, hex_color: str, data: dict) -> discord.Role | None:
+    color_int = hex_to_int(hex_color)
+    role_id = data["grades"][grade_label].get("role_id")
+    role = None
+    try:
+        if role_id:
+            role = guild.get_role(int(role_id))
+        if role:
+            if role.colour.value != color_int:
+                await role.edit(colour=discord.Colour(color_int), reason="Grade colour sync")
+        else:
+            role = await guild.create_role(name=f"[{grade_label}]", colour=discord.Colour(color_int), reason=f"Grade tier: {grade_label}")
+            data["grades"][grade_label]["role_id"] = role.id
+        return role
+    except (discord.Forbidden, discord.HTTPException):
+        return None
+
+async def sync_grade_role_for_owner(
+    guild: discord.Guild,
+    owner_id: str,
+    new_grade_label: str | None,
+    old_grade_label: str | None,
+    data: dict
+) -> None:
+    try:
+        member = guild.get_member(int(owner_id))
+        if not member:
+            return
+
+        # Remove old grade role if applicable
+        if old_grade_label and old_grade_label != new_grade_label:
+            has_other = any(
+                oc["owner_id"] == owner_id and oc.get("grade") == old_grade_label and not oc.get("eliminated", False)
+                for oc in data["ocs"].values()
+            )
+            if not has_other:
+                old_role_id = data["grades"].get(old_grade_label, {}).get("role_id")
+                if old_role_id:
+                    old_role = guild.get_role(int(old_role_id))
+                    if old_role and old_role in member.roles:
+                        await member.remove_roles(old_role, reason="Grade reassignment")
+        
+        # Assign new grade role if applicable
+        if new_grade_label:
+            hex_color = data["grades"][new_grade_label]["color"]
+            new_role = await ensure_grade_role(guild, new_grade_label, hex_color, data)
+            if new_role and new_role not in member.roles:
+                await member.add_roles(new_role, reason=f"Grade {new_grade_label} assigned")
+                
+    except (discord.Forbidden, discord.HTTPException):
+        pass
 
 # ==========================================
 # 3. UTILITY FUNCTIONS & SHARED VIEWS
@@ -578,6 +665,146 @@ class ConfirmPurgeView(discord.ui.View):
 
     async def on_timeout(self):
         await self._disable_all()
+
+class ConfirmDeleteOCView(discord.ui.View):
+    """Two-button ephemeral confirmation for the /deleteoc command."""
+
+    def __init__(self, oc_id: str, oc_name: str, came_from_archive: bool, actor: discord.Member):
+        super().__init__(timeout=45)
+        self.oc_id = oc_id
+        self.oc_name = oc_name
+        self.came_from_archive = came_from_archive
+        self.actor = actor
+        self.message: discord.Message = None
+
+    async def _disable_all(self):
+        for item in self.children:
+            item.disabled = True
+        if self.message:
+            try:
+                await self.message.edit(view=self)
+            except discord.NotFound:
+                pass
+
+    @discord.ui.button(label="🗑️ Yes, Delete Permanently", style=discord.ButtonStyle.danger)
+    async def confirm_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._disable_all()
+        data = load_data()
+        
+        oc = data["ocs"].get(self.oc_id) or data["archived_ocs"].get(self.oc_id)
+        if not oc:
+            return await interaction.response.edit_message(embed=get_embed("Error", "OC not found in data anymore.", "error"), view=self)
+
+        purged_summary = []
+        
+        # 1 & 2: Active or Archived OCs
+        if self.oc_id in data["ocs"]:
+            del data["ocs"][self.oc_id]
+            purged_summary.append("Removed from active OCs")
+        if self.oc_id in data["archived_ocs"]:
+            del data["archived_ocs"][self.oc_id]
+            purged_summary.append("Removed from archived OCs")
+            
+        # 3: Feeds
+        if self.oc_id in data.get("feeds", {}):
+            del data["feeds"][self.oc_id]
+            purged_summary.append("Removed feed list")
+            
+        # 4: Vote tallies
+        for oc_id_key, voters in list(data["voting"].get("votes", {}).items()):
+            if oc_id_key == self.oc_id:
+                del data["voting"]["votes"][oc_id_key]
+                purged_summary.append("Removed from vote tallies")
+                
+        # 5: User votes
+        removed_user_votes = False
+        for uid, user_votes_list in data["voting"].get("user_votes", {}).items():
+            if self.oc_id in user_votes_list:
+                data["voting"]["user_votes"][uid] = [x for x in user_votes_list if x != self.oc_id]
+                removed_user_votes = True
+        if removed_user_votes:
+            purged_summary.append("Removed from user vote history")
+                
+        # 6: Dorm occupants
+        for f_name, f_data in data.get("dorms", {}).items():
+            for r_name, r_data in f_data.get("rooms", {}).items():
+                if self.oc_id in r_data.get("occupants", []):
+                    try:
+                        r_data["occupants"].remove(self.oc_id)
+                        purged_summary.append(f"Removed from dorm {f_name} / Room {r_name}")
+                    except ValueError:
+                        pass
+                        
+        # 7: Mission groups
+        for mg in data.get("mission_groups", {}).values():
+            if self.oc_id in mg.get("members", []):
+                mg["members"].remove(self.oc_id)
+                purged_summary.append(f"Removed from mission group: {mg['name']}")
+                
+        # 8: Peer ranking sessions
+        removed_from_peer = False
+        for sess in data.get("peer_ranking_sessions", {}).values():
+            for uid, ballot in sess.get("ballots", {}).items():
+                if self.oc_id in ballot:
+                    sess["ballots"][uid] = [x for x in ballot if x != self.oc_id]
+                    removed_from_peer = True
+            if sess.get("benefit_applied_to") == self.oc_id:
+                sess["benefit_applied_to"] = None
+                removed_from_peer = True
+            if sess.get("penalty_applied_to") == self.oc_id:
+                sess["penalty_applied_to"] = None
+                removed_from_peer = True
+        if removed_from_peer:
+            purged_summary.append("Removed from peer ranking sessions")
+                
+        # 9: Point log
+        original_log_len = len(data.get("point_log", []))
+        data["point_log"] = [entry for entry in data.get("point_log", []) if entry.get("oc_id") != self.oc_id]
+        if len(data["point_log"]) < original_log_len:
+            purged_summary.append(f"Removed {original_log_len - len(data['point_log'])} point log entries")
+            
+        # 10: Rank snapshots
+        removed_from_snaps = False
+        for snap in data.get("rank_snapshots", []):
+            original_snap_len = len(snap.get("rankings", []))
+            snap["rankings"] = [r for r in snap.get("rankings", []) if r.get("oc_id") != self.oc_id]
+            if len(snap["rankings"]) < original_snap_len:
+                removed_from_snaps = True
+        if removed_from_snaps:
+            purged_summary.append("Removed from rank snapshots")
+            
+        # Cleanup Role
+        if interaction.guild:
+            await sync_grade_role_for_owner(
+                interaction.guild,
+                oc["owner_id"],
+                new_grade_label=None,
+                old_grade_label=oc.get("grade"),
+                data=data
+            )
+            
+        save_data(data, reason=f"hard-delete OC: {self.oc_name}", actor=self.actor)
+        
+        if not self.came_from_archive:
+            recalculate_ranks(data)
+            
+        desc = "\n".join(f"• {line}" for line in purged_summary)
+        await interaction.response.edit_message(
+            embed=get_embed("🗑️ OC Hard-Deleted", f"Successfully and permanently deleted **{self.oc_name}**.\n\n**Cleanup Summary:**\n{desc}", "success"), 
+            view=self
+        )
+
+    @discord.ui.button(label="✖ Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._disable_all()
+        await interaction.response.edit_message(
+            embed=get_embed("Cancelled", "Hard-delete aborted. The OC was not modified.", "system"), 
+            view=self
+        )
+    
+    async def on_timeout(self):
+        await self._disable_all()
+
 
 class FeedPostView(discord.ui.View):
     """
@@ -893,6 +1120,15 @@ class ConfigCog(commands.Cog):
         save_data(data)
         await interaction.response.send_message(embed=get_embed("Success", f"Backup channel updated to {channel.mention}", "success"), ephemeral=True)
 
+    @app_commands.command(name="setdatachannel", description="[DEV] Set the channel that receives automatic data-change notifications.")
+    @app_commands.describe(channel="The text channel to designate for this purpose.")
+    @is_dev()
+    async def set_data_channel(self, interaction: discord.Interaction, channel: discord.TextChannel):
+        data = load_data()
+        data["config"]["data_channel_id"] = channel.id
+        save_data(data, reason="set data channel", actor=interaction.user)
+        await interaction.response.send_message(embed=get_embed("Success", f"Data channel updated to {channel.mention}", "success"), ephemeral=True)
+
     @app_commands.command(name="backup", description="[DEV] Export the full data.json to the backup channel")
     @is_dev()
     async def backup(self, interaction: discord.Interaction):
@@ -1096,10 +1332,11 @@ class RegistrationCog(commands.Cog):
     @app_commands.command(name="removeoc", description="Archive a Trainee (Irreversible)")
     @app_commands.describe(oc_name="The name of your Trainee OC to permanently archive. This action cannot be undone.")
     async def removeoc(self, interaction: discord.Interaction, oc_name: str):
+        await interaction.response.defer(ephemeral=True)
         data = load_data()
         oc = find_oc(oc_name, data)
         if not oc or oc["owner_id"] != str(interaction.user.id):
-            return await interaction.response.send_message(embed=get_embed("Error", "Hmm, we couldn't find that Trainee in your roster. Double-check the name and try again!", "error"), ephemeral=True)
+            return await interaction.followup.send(embed=get_embed("Error", "Hmm, we couldn't find that Trainee in your roster. Double-check the name and try again!", "error"))
         
         if oc.get("dorm_floor") and oc.get("dorm_room"):
             try:
@@ -1110,7 +1347,52 @@ class RegistrationCog(commands.Cog):
         data["archived_ocs"][oc["id"]] = oc
         del data["ocs"][oc["id"]]
         recalculate_ranks(data)
-        await interaction.response.send_message(embed=get_embed("OC Archived", f"**{oc_name}** has been archived and removed from the active roster. Take care! 👋", "success"))
+        
+        if interaction.guild:
+            await sync_grade_role_for_owner(
+                interaction.guild,
+                oc["owner_id"],
+                new_grade_label=None,
+                old_grade_label=oc.get("grade"),
+                data=data
+            )
+            
+        save_data(data, reason=f"OC archived: {oc_name}", actor=interaction.user)
+        
+        await interaction.followup.send(embed=get_embed("OC Archived", f"**{oc_name}** has been archived and removed from the active roster. Take care! 👋", "success"))
+
+    @app_commands.command(name="deleteoc", description="[DEV] Permanently and irreversibly delete an OC from all data")
+    @app_commands.describe(oc_name="The name of the OC to permanently purge. Searches active and archived OCs.")
+    @is_dev()
+    async def deleteoc(self, interaction: discord.Interaction, oc_name: str):
+        data = load_data()
+        oc = find_oc(oc_name, data)
+        came_from_archive = False
+        
+        if not oc:
+            name_lower = oc_name.lower()
+            for a_oc in data["archived_ocs"].values():
+                if a_oc["name"].lower() == name_lower:
+                    oc = a_oc
+                    came_from_archive = True
+                    break
+                    
+        if not oc:
+            return await interaction.response.send_message(
+                embed=get_embed("Not Found", f"Could not find an active or archived OC named '{oc_name}'.", "error"), 
+                ephemeral=True
+            )
+            
+        status = "Archived" if came_from_archive else ("Eliminated" if oc.get("eliminated") else "Active")
+        
+        view = ConfirmDeleteOCView(oc["id"], oc["name"], came_from_archive, interaction.user)
+        embed = get_embed(
+            "⚠️ Confirm Hard-Delete",
+            f"**OC:** {oc['name']}\n**Owner:** <@{oc['owner_id']}>\n**Status:** {status}\n\n**This cannot be undone. The OC will be erased from all collections.**",
+            "error"
+        )
+        msg = await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+        view.message = await interaction.original_response()
 
     @app_commands.command(name="oc_all", description="Browse all currently registered Trainees")
     async def oc_all(self, interaction: discord.Interaction):
@@ -1586,10 +1868,33 @@ class GradesCog(commands.Cog):
     async def grade_create(self, interaction: discord.Interaction, label: str, hex_color: str):
         if not hex_color.startswith("#") or len(hex_color) != 7:
             return await interaction.response.send_message(embed=get_embed("Error", "Invalid hex. Use #RRGGBB format.", "error"), ephemeral=True)
+            
+        await interaction.response.defer(ephemeral=True)
         data = load_data()
-        data["grades"][label] = {"color": hex_color}
-        save_data(data)
-        await interaction.response.send_message(embed=get_embed("Grade Created", f"Grade **{label}** created with color {hex_color}.", "success"), ephemeral=True)
+        
+        is_update = label in data["grades"]
+        
+        if is_update:
+            data["grades"][label]["color"] = hex_color
+        else:
+            data["grades"][label] = {"color": hex_color, "role_id": None}
+            
+        if interaction.guild:
+            await ensure_grade_role(interaction.guild, label, hex_color, data)
+            
+        if is_update and interaction.guild:
+            owners = set(oc["owner_id"] for oc in data["ocs"].values() if oc.get("grade") == label and not oc.get("eliminated", False))
+            for owner_id in owners:
+                await sync_grade_role_for_owner(interaction.guild, owner_id, label, label, data)
+                
+        save_data(
+            data, 
+            reason=f"grade updated: {label} → {hex_color}" if is_update else f"grade created: {label}", 
+            actor=interaction.user
+        )
+        
+        action_str = "updated" if is_update else "created"
+        await interaction.followup.send(embed=get_embed("Grade Configured", f"Grade **{label}** {action_str} with color {hex_color}.", "success"))
 
     @app_commands.command(name="assigngrade", description="Assign a grade to an OC (Dev only)")
     @app_commands.describe(
@@ -1598,16 +1903,32 @@ class GradesCog(commands.Cog):
     )
     @is_dev()
     async def assigngrade(self, interaction: discord.Interaction, oc_name: str, grade_label: str):
+        await interaction.response.defer(ephemeral=True)
         data = load_data()
         oc = find_oc(oc_name, data)
         if not oc:
-            return await interaction.response.send_message(embed=get_embed("Not Found", "We looked everywhere but couldn't find that Trainee.", "error"), ephemeral=True)
+            return await interaction.followup.send(embed=get_embed("Not Found", "We looked everywhere but couldn't find that Trainee.", "error"))
         if grade_label not in data["grades"]:
-            return await interaction.response.send_message(embed=get_embed("Not Found", "We couldn't find a grade tier with that label. Use **/grade_create** to create it first!", "error"), ephemeral=True)
+            return await interaction.followup.send(embed=get_embed("Not Found", "We couldn't find a grade tier with that label. Use **/grade_create** to create it first!", "error"))
         
+        old_grade = oc.get("grade")
         oc["grade"] = grade_label
-        save_data(data)
-        await interaction.response.send_message(embed=get_embed("Grade Assigned", f"**{oc['name']}** is now Grade **{grade_label}**.", "success"))
+        
+        if interaction.guild:
+            await ensure_grade_role(interaction.guild, grade_label, data["grades"][grade_label]["color"], data)
+            await sync_grade_role_for_owner(interaction.guild, oc["owner_id"], grade_label, old_grade, data)
+            
+        save_data(data, reason=f"grade assigned: {oc['name']} → {grade_label}", actor=interaction.user)
+        
+        await interaction.followup.send(
+            embed=get_embed(
+                "Grade Assigned",
+                f"**{oc['name']}** is now Grade **{grade_label}**.\n"
+                f"Owner {discord.utils.mention_user(int(oc['owner_id']))} has been given the "
+                f"**[{grade_label}]** role with colour `{data['grades'][grade_label]['color']}`.",
+                "success"
+            )
+        )
 
 class DormsCog(commands.Cog):
     def __init__(self, bot):
