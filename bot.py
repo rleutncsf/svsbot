@@ -95,7 +95,8 @@ HELP_SECTIONS = {
         "dev_commands": [
             ("/points", "oc_name action value", "🔒 Add, Deduct, Multiply, or Set a Trainee's mission points."),
             ("/resetallpoints", "", "🔒 Zero all OC points and anchor a new ranking baseline snapshot. Requires voting to be closed first."),
-            ("/export_rankings", "", "🔒 Export full state (rankings, history, logs, feeds) as a TSV file."),
+            ("/rankings_private", "", "🔒 See all current rankings privately. Bypasses open/closed voting gate. Shows live tally with pagination."),
+            ("/export_rankings", "", "🔒 Export full state (rankings, history, logs, feeds) as a CSV file."),
         ]
     },
     "dorms": {
@@ -1769,7 +1770,7 @@ class VotingCog(commands.Cog):
             ephemeral=True
         )
 
-    @app_commands.command(name="votingopen", description="🔒 Open a new voting round immediately, or schedule it for a specific KST datetime (year/month/day hour/minute).")
+    @app_commands.command(name="votingopen", description="[DEV] Open voting now or schedule it for a KST datetime (year/month/day hour/minute).")
     @app_commands.describe(
         year="(Optional) Year to open voting. If omitted, opens immediately.",
         month="(Optional) Month (1–12).",
@@ -1808,7 +1809,7 @@ class VotingCog(commands.Cog):
             save_data(data, reason="voting_open_scheduled", actor=interaction.user)
             await interaction.response.send_message(embed=get_embed("Voting Scheduled", f"✅ Voting is scheduled to open on **{target_dt.strftime('%Y/%m/%d %H:%M KST')}**.", "success"), ephemeral=True)
 
-    @app_commands.command(name="votingclose", description="🔒 Close voting immediately or schedule it. Applies the multiplier, tallies votes, and updates rankings.")
+    @app_commands.command(name="votingclose", description="[DEV] Close voting now or schedule it. Applies the multiplier and updates rankings.")
     @app_commands.describe(
         year="(Optional) Year to close voting. If omitted, closes immediately.",
         month="(Optional) Month (1–12).",
@@ -2810,28 +2811,49 @@ class RankingsCog(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
 
-    @app_commands.command(name="rankings_private", description="View full rankings privately and save snapshot (Dev only)")
+    @app_commands.command(name="rankings_private", description="[DEV] View all rankings privately (paginated). Shows live points.")
     @is_dev()
     async def private(self, interaction: discord.Interaction):
         data = load_data()
+        
+        voting_status_note = "🟢 Voting is **OPEN** — live tally shown." if data["voting"]["is_open"] else "🔴 Voting is **CLOSED**."
+        
         ocs = [oc for oc in data["ocs"].values() if not oc.get("eliminated", False)]
+        if not ocs:
+            return await interaction.response.send_message(
+                embed=get_embed("Empty Roster", "There are no active Trainees to display.", "warning"),
+                ephemeral=True
+            )
+            
         ocs.sort(key=lambda x: x.get("current_rank", 9999))
         
+        page_size = data["config"].get("reveal_page_size", 7)
         debut_slots = data["config"].get("debut_slots", 0)
-        desc = ""
-        prev_rank = 0
         
-        for oc in ocs:
-            if debut_slots > 0 and prev_rank <= debut_slots and oc["current_rank"] > debut_slots:
-                desc += f"`{'─' * 30}` ← Debut Line\n\n"
-            
-            change = get_rank_change(oc["id"], oc["current_rank"], data)
-            grade_str = f" [{oc['grade']}]" if oc.get('grade') else ""
-            desc += f"**#{oc['current_rank']}** {change} · {oc['name']}{grade_str} · {oc['total_points']:,} pts\n"
-            prev_rank = oc["current_rank"]
-            
-        embed = get_embed("Live Internal Rankings", desc, show_footer=True)
+        batches = [ocs[i:i+page_size] for i in range(0, len(ocs), page_size)]
+        pages = []
         
+        for idx, batch in enumerate(batches):
+            embed = discord.Embed(title=f"Private Rankings — Page {idx+1}/{len(batches)}", color=COLORS["system"])
+            
+            if idx == 0:
+                embed.add_field(name="📊 Status", value=voting_status_note, inline=False)
+                
+            for oc in batch:
+                change = get_rank_change(oc["id"], oc["current_rank"], data)
+                grade_str = f" [{oc['grade']}]" if oc.get('grade') else ""
+                
+                if debut_slots > 0 and oc["current_rank"] == debut_slots + 1:
+                    embed.add_field(name="── DEBUT LINE ──", value=f"Top {debut_slots} trainee(s) debut.", inline=False)
+                    
+                embed.add_field(
+                    name=f"#{oc['current_rank']} {change}{grade_str}",
+                    value=f"**{oc['name']}** · {oc['total_points']:,} pts\n<@{oc['owner_id']}>",
+                    inline=False
+                )
+                
+            pages.append(embed)
+            
         snapshot = {
             "timestamp": now().isoformat(),
             "trigger": "RANKINGS_PRIVATE_COMMAND",
@@ -2840,7 +2862,12 @@ class RankingsCog(commands.Cog):
         data["rank_snapshots"].append(snapshot)
         save_data(data, reason="rankings_private_snapshot", actor=interaction.user)
         
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        if len(pages) == 1:
+            await interaction.response.send_message(embed=pages[0], ephemeral=True)
+        else:
+            view = RankingPaginationView(pages)
+            msg = await interaction.response.send_message(embed=pages[0], view=view, ephemeral=True)
+            view.message = await interaction.original_response()
 
     @app_commands.command(name="rankings_reveal", description="Dramatically reveal all rankings publicly (Dev only)")
     @is_dev()
@@ -2891,12 +2918,12 @@ class ExportCog(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
 
-    @app_commands.command(name="export_rankings", description="Export full state to TSV (Dev only)")
+    @app_commands.command(name="export_rankings", description="[DEV] Export full rankings, history, logs, and feeds as a CSV file.")
     @is_dev()
     async def export_rankings(self, interaction: discord.Interaction):
         data = load_data()
         output = io.StringIO()
-        writer = csv.writer(output, delimiter='\t')
+        writer = csv.writer(output, delimiter=',', quoting=csv.QUOTE_ALL)
         
         writer.writerow(["--- SECTION 1: CURRENT RANKINGS ---"])
         writer.writerow(["rank", "oc_name", "owner_discord_id", "owner_username", "grade", "total_points", "voting_points", "mission_points", "rank_change", "dorm_floor", "dorm_room", "registered_at", "eliminated", "profile_picture_url"])
@@ -2959,7 +2986,7 @@ class ExportCog(commands.Cog):
                 ])
 
         output.seek(0)
-        file = discord.File(fp=io.BytesIO(output.getvalue().encode('utf-8')), filename=f"rankings_export_{now().strftime('%Y-%m-%d_%H-%M')}.tsv")
+        file = discord.File(fp=io.BytesIO(output.getvalue().encode('utf-8-sig')), filename=f"rankings_export_{now().strftime('%Y-%m-%d_%H-%M')}.csv")
         await interaction.response.send_message("Here is the requested data export.", file=file, ephemeral=True)
 
 class HelpCog(commands.Cog):
