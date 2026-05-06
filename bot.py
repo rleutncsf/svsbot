@@ -13,6 +13,7 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 import threading
 import csv
 import random
+import copy
 
 # ==========================================
 # 1. CONSTANTS & SYSTEM DEFAULTS
@@ -30,6 +31,29 @@ COLORS = {
     "warning": 0xF4A261,
     "neutral": 0xB0B0B0
 }
+
+TIMEZONE_CHOICES = [
+    app_commands.Choice(name="UTC (UTC+0)",                     value="UTC"),
+    app_commands.Choice(name="Asia/Seoul — KST (UTC+9)",        value="Asia/Seoul"),
+    app_commands.Choice(name="Asia/Tokyo — JST (UTC+9)",        value="Asia/Tokyo"),
+    app_commands.Choice(name="Asia/Manila — PHT (UTC+8)",       value="Asia/Manila"),
+    app_commands.Choice(name="Asia/Singapore — SGT (UTC+8)",    value="Asia/Singapore"),
+    app_commands.Choice(name="Asia/Jakarta — WIB (UTC+7)",      value="Asia/Jakarta"),
+    app_commands.Choice(name="Asia/Bangkok — ICT (UTC+7)",      value="Asia/Bangkok"),
+    app_commands.Choice(name="Asia/Kolkata — IST (UTC+5:30)",   value="Asia/Kolkata"),
+    app_commands.Choice(name="Asia/Dubai — GST (UTC+4)",        value="Asia/Dubai"),
+    app_commands.Choice(name="Europe/London — GMT/BST",         value="Europe/London"),
+    app_commands.Choice(name="Europe/Paris — CET/CEST (UTC+1/+2)", value="Europe/Paris"),
+    app_commands.Choice(name="Europe/Berlin — CET/CEST (UTC+1/+2)", value="Europe/Berlin"),
+    app_commands.Choice(name="America/New_York — EST/EDT",      value="America/New_York"),
+    app_commands.Choice(name="America/Chicago — CST/CDT",       value="America/Chicago"),
+    app_commands.Choice(name="America/Denver — MST/MDT",        value="America/Denver"),
+    app_commands.Choice(name="America/Los_Angeles — PST/PDT",   value="America/Los_Angeles"),
+    app_commands.Choice(name="America/Toronto — EST/EDT",       value="America/Toronto"),
+    app_commands.Choice(name="America/Sao_Paulo — BRT (UTC-3)", value="America/Sao_Paulo"),
+    app_commands.Choice(name="Pacific/Auckland — NZST (UTC+12)",value="Pacific/Auckland"),
+    app_commands.Choice(name="Australia/Sydney — AEST/AEDT",    value="Australia/Sydney"),
+]
 
 KST = zoneinfo.ZoneInfo("Asia/Seoul")
 
@@ -136,8 +160,11 @@ HELP_SECTIONS = {
             ("/config_view", "", "🔒 View all current configuration values."),
             ("/setassetchannel", "channel", "🔒 Set the persistent asset storage channel."),
             ("/setfeedchannel", "channel", "🔒 Set the public feed channel."),
+            ("/setbackupchannel", "channel", "🔒 Set the designated channel for JSON backups."),
+            ("/backup", "", "🔒 Export the full data.json to the backup channel. Creates the channel automatically if it doesn't exist."),
             ("/setrevealpage", "size", "🔒 Set how many Trainees appear per reveal page (1–25)."),
             ("/config setdebutslots", "slots [public]", "🔒 Mark the top N ranking positions as the debut line."),
+            ("/purgedata", "", "🔒 ⚠️ Permanently reset ALL data to factory defaults. Requires confirmation. Irreversible."),
         ]
     },
 }
@@ -153,6 +180,7 @@ DEFAULT_SCHEMA = {
         "reveal_color": "#FFD700",
         "asset_channel": None,
         "feed_channel": None,
+        "backup_channel_id": None,
         "reveal_page_size": 7,
         "debut_slots": 0,
         "debut_slots_public": True,
@@ -196,7 +224,7 @@ def load_data():
         with open(DATA_FILE, "w", encoding="utf-8") as f:
             json.dump(DEFAULT_SCHEMA, f, indent=4)
         print("Initialization: Created new data.json with default schema.")
-        return DEFAULT_SCHEMA
+        return copy.deepcopy(DEFAULT_SCHEMA)
     
     try:
         with open(DATA_FILE, "r", encoding="utf-8") as f:
@@ -307,11 +335,20 @@ def today_kst() -> datetime.date:
 def format_dt(dt_str):
     if not dt_str: return "Unknown"
     dt = datetime.fromisoformat(dt_str).astimezone(get_tz())
-    return dt.strftime("%b %d, %Y · %H:%M %Z")
+    return dt.strftime("%Y/%m/%d · %H:%M %Z")
+
+def format_date_display(date_str: str) -> str:
+    """Convert stored YYYY-MM-DD to display format YYYY/MM/DD. Returns original string on failure."""
+    try:
+        dt = datetime.strptime(date_str, "%Y-%m-%d")
+        return dt.strftime("%Y/%m/%d")
+    except (ValueError, TypeError):
+        return date_str or "Unknown"
 
 def calculate_age(dob_str: str) -> int | str:
     """
     Calculate age in full years using the current date in KST (UTC+9).
+    Input must be stored as YYYY-MM-DD; display format for UI is YYYY/MM/DD.
     Returns an int on success, or the string "Unknown" on parse failure.
     """
     try:
@@ -367,9 +404,6 @@ def find_oc(name: str, data: dict):
     return None
 
 def get_rank_change(oc_id, current_rank, data):
-    # NOTE: The baseline snapshot is always data["rank_snapshots"][-1].
-    # After /resetallpoints runs, this becomes the post-reset baseline,
-    # so all diff arrows reflect movement since the last reset.
     if not data["rank_snapshots"]:
         return "—"
     last_snap = data["rank_snapshots"][-1]["rankings"]
@@ -445,7 +479,7 @@ class ConfirmResetView(discord.ui.View):
 
         if not active_ocs:
             return await interaction.response.edit_message(
-                embed=get_embed("Nothing to Reset", "There are no active OCs to reset.", "warning"),
+                embed=get_embed("Nothing to Reset", "There are no active Trainees with points to reset right now!", "warning"),
                 view=self
             )
 
@@ -495,7 +529,50 @@ class ConfirmResetView(discord.ui.View):
     async def cancel_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self._disable_all()
         await interaction.response.edit_message(
-            embed=get_embed("Cancelled", "Point reset aborted. No changes were made.", "system"),
+            embed=get_embed("Cancelled", "No worries — the reset was cancelled. Everything stays the same. ✌️", "system"),
+            view=self
+        )
+
+    async def on_timeout(self):
+        await self._disable_all()
+
+class ConfirmPurgeView(discord.ui.View):
+    """Two-button ephemeral confirmation for the /purgedata command."""
+
+    def __init__(self):
+        super().__init__(timeout=30)
+        self.message: discord.Message = None
+
+    async def _disable_all(self):
+        for item in self.children:
+            item.disabled = True
+        if self.message:
+            try:
+                await self.message.edit(view=self)
+            except discord.NotFound:
+                pass
+
+    @discord.ui.button(label="⚠️ YES, WIPE EVERYTHING", style=discord.ButtonStyle.danger)
+    async def confirm_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._disable_all()
+        # Perform atomic reset: overwrite data.json with DEFAULT_SCHEMA
+        save_data(copy.deepcopy(DEFAULT_SCHEMA))
+        await interaction.response.edit_message(
+            embed=get_embed(
+                "🗑️ All Data Wiped",
+                "The data file has been reset to factory defaults. All OCs, votes, points, dorms, "
+                "feeds, mission groups, grades, and configuration have been permanently deleted.\n\n"
+                "Run **/setup** to reconfigure the bot.",
+                "error"
+            ),
+            view=self
+        )
+
+    @discord.ui.button(label="✖ Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._disable_all()
+        await interaction.response.edit_message(
+            embed=get_embed("Cancelled", "Phew! The wipe was cancelled. Nothing was changed. ✌️", "system"),
             view=self
         )
 
@@ -550,7 +627,6 @@ class FeedPostView(discord.ui.View):
         try:
             original_embed = interaction.message.embeds[0]
             old_footer = original_embed.footer.text or ""
-            # Calculate updated like count based on post retrieved right after incrementing
             updated_likes = next((p["like_count"] for feed in data["feeds"].values() for p in feed if p["post_id"] == self.post_id), 0)
             new_footer = re.sub(r"❤️ \d+ likes", f"❤️ {updated_likes} likes", old_footer)
             original_embed.set_footer(text=new_footer)
@@ -643,11 +719,10 @@ class CommentModal(discord.ui.Modal, title="Leave a Comment"):
                 ephemeral=True
             )
 
-        await interaction.response.send_message(embed=get_embed("Comment Posted", "Your comment has been added to the thread.", "success"), ephemeral=True)
+        await interaction.response.send_message(embed=get_embed("Comment Posted", "💬 Your comment is posted! Head to the thread to continue the conversation.", "success"), ephemeral=True)
 
 async def _run_sequential_reveal(channel: discord.TextChannel, ocs_ordered: list, reveal_color: int, page_size: int, data: dict, show_debut_line: bool = True):
     pages = []
-    # ocs_ordered is sorted from worst to best (highest rank number first)
     batches = [ocs_ordered[i:i + page_size] for i in range(0, len(ocs_ordered), page_size)]
     
     debut_slots = data["config"].get("debut_slots", 0)
@@ -702,12 +777,7 @@ async def _run_sequential_reveal(channel: discord.TextChannel, ocs_ordered: list
 class SurvivalBot(commands.Bot):
     def __init__(self):
         intents = discord.Intents.default()
-        # Enable only the privileged intents you actually read.
-        # members: required if you call guild.get_member(), guild.members, or
-        #          use Member objects in interactions beyond interaction.user.
-        # message_content: NOT needed — no on_message / prefix command logic is live.
-        # presences: NOT needed — no status/activity reads anywhere.
-        intents.members = True   # Enable ONLY this privileged intent.
+        intents.members = True
         super().__init__(command_prefix="!", intents=intents)
 
     async def setup_hook(self):
@@ -724,7 +794,6 @@ class SurvivalBot(commands.Bot):
         await self.add_cog(HelpCog(self))
         await self.add_cog(FeedCog(self))
 
-        # Re-register all live feed post views for persistence across restarts
         data = load_data()
         for feed_list in data.get("feeds", {}).values():
             for post in feed_list:
@@ -740,10 +809,10 @@ bot = SurvivalBot()
 @bot.tree.error
 async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
     if isinstance(error, app_commands.CheckFailure):
-        embed = get_embed("Access Denied", "🔒 This command is restricted to show staff. Please contact a Dev if you believe this is an error.", "error")
+        embed = get_embed("Access Denied", "🔒 This command is for staff only! If you think you should have access, reach out to a Dev.", "error")
         await interaction.response.send_message(embed=embed, ephemeral=True)
     else:
-        embed = get_embed("System Error", f"An unexpected error occurred: {str(error)}", "error")
+        embed = get_embed("System Error", f"Oops! Something went wrong on our end. Here's the error detail in case you need it: {str(error)}", "error")
         if interaction.response.is_done():
             await interaction.followup.send(embed=embed, ephemeral=True)
         else:
@@ -760,18 +829,34 @@ class ConfigCog(commands.Cog):
     config_group = app_commands.Group(name="config", description="[DEV] Additional Configuration Commands")
 
     @app_commands.command(name="setup", description="Initial bot configuration (Dev only)")
+    @app_commands.describe(
+        timezone="Your server's IANA timezone name, e.g. 'Asia/Seoul' or 'America/New_York'. Used for all timestamps.",
+        announce_channel="The text channel where voting results, eliminations, and announcements will be posted.",
+        dev_role="The Discord role that grants access to all [DEV] commands.",
+        asset_channel="(Optional) A private channel used to host uploaded OC profile pictures. Required for /register with images."
+    )
+    @app_commands.choices(timezone=TIMEZONE_CHOICES)
     @is_dev()
-    async def setup(self, interaction: discord.Interaction, timezone: str, announce_channel: discord.TextChannel, dev_role: discord.Role, asset_channel: discord.TextChannel = None):
+    async def setup(self, interaction: discord.Interaction, timezone: app_commands.Choice[str], announce_channel: discord.TextChannel, dev_role: discord.Role, asset_channel: discord.TextChannel = None):
         data = load_data()
-        data["config"]["timezone"] = timezone
+        data["config"]["timezone"] = timezone.value
         data["config"]["announcement_channel_id"] = announce_channel.id
         data["config"]["dev_role_id"] = dev_role.id
         if asset_channel:
             data["config"]["asset_channel"] = asset_channel.id
         save_data(data)
         
-        asset_msg = f"\nAsset Channel: {asset_channel.mention}" if asset_channel else ""
-        await interaction.response.send_message(embed=get_embed("Setup Complete", f"Timezone: {timezone}\nAnnounce Channel: {announce_channel.mention}\nDev Role: {dev_role.mention}{asset_msg}", "success"), ephemeral=True)
+        await interaction.response.send_message(
+            embed=get_embed(
+                "✅ Setup Complete",
+                f"**Timezone:** {timezone.name} (`{timezone.value}`)\n"
+                f"**Announce Channel:** {announce_channel.mention}\n"
+                f"**Dev Role:** {dev_role.mention}"
+                + (f"\n**Asset Channel:** {asset_channel.mention}" if asset_channel else ""),
+                "success"
+            ),
+            ephemeral=True
+        )
 
     @app_commands.command(name="config_view", description="View configuration settings (Dev only)")
     @is_dev()
@@ -782,6 +867,7 @@ class ConfigCog(commands.Cog):
         await interaction.response.send_message(embed=get_embed("System Configuration", desc), ephemeral=True)
 
     @app_commands.command(name="setassetchannel", description="[DEV] Set the persistent asset storage channel")
+    @app_commands.describe(channel="The text channel to designate for this purpose.")
     @is_dev()
     async def set_asset_channel(self, interaction: discord.Interaction, channel: discord.TextChannel):
         data = load_data()
@@ -790,6 +876,7 @@ class ConfigCog(commands.Cog):
         await interaction.response.send_message(embed=get_embed("Success", f"Asset channel updated to {channel.mention}", "success"), ephemeral=True)
 
     @app_commands.command(name="setfeedchannel", description="[DEV] Set the public OC feed channel")
+    @app_commands.describe(channel="The text channel to designate for this purpose.")
     @is_dev()
     async def set_feed_channel(self, interaction: discord.Interaction, channel: discord.TextChannel):
         data = load_data()
@@ -797,7 +884,60 @@ class ConfigCog(commands.Cog):
         save_data(data)
         await interaction.response.send_message(embed=get_embed("Success", f"Feed channel set to {channel.mention}.", "success"), ephemeral=True)
 
+    @app_commands.command(name="setbackupchannel", description="[DEV] Set the designated channel for JSON backups.")
+    @app_commands.describe(channel="The text channel to designate for this purpose.")
+    @is_dev()
+    async def set_backup_channel(self, interaction: discord.Interaction, channel: discord.TextChannel):
+        data = load_data()
+        data["config"]["backup_channel_id"] = channel.id
+        save_data(data)
+        await interaction.response.send_message(embed=get_embed("Success", f"Backup channel updated to {channel.mention}", "success"), ephemeral=True)
+
+    @app_commands.command(name="backup", description="[DEV] Export the full data.json to the backup channel")
+    @is_dev()
+    async def backup(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        data = load_data()
+        backup_channel_id = data["config"].get("backup_channel_id")
+        backup_ch = None
+        
+        if backup_channel_id:
+            backup_ch = self.bot.get_channel(int(backup_channel_id))
+            
+        if backup_ch is None:
+            overwrites = {
+                interaction.guild.default_role: discord.PermissionOverwrite(read_messages=False),
+                interaction.guild.me: discord.PermissionOverwrite(read_messages=True, send_messages=True, attach_files=True),
+            }
+            dev_role_id = data["config"].get("dev_role_id")
+            if dev_role_id:
+                dev_role = interaction.guild.get_role(int(dev_role_id))
+                if dev_role:
+                    overwrites[dev_role] = discord.PermissionOverwrite(read_messages=True)
+
+            backup_ch = await interaction.guild.create_text_channel(
+                name="data-backups",
+                overwrites=overwrites,
+                reason="Auto-created by bot for JSON data backups"
+            )
+            data["config"]["backup_channel_id"] = backup_ch.id
+            save_data(data)
+            await interaction.followup.send(f"Backup channel was missing and has been auto-created: {backup_ch.mention}", ephemeral=True)
+
+        json_data = json.dumps(data, indent=4, ensure_ascii=False).encode('utf-8')
+        file = discord.File(fp=io.BytesIO(json_data), filename=f"backup_{now().strftime('%Y-%m-%d_%H-%M-%S')}.json")
+        
+        embed = get_embed(
+            "📦 Data Backup",
+            f"Backup generated on {now().strftime('%Y-%m-%d %H:%M:%S')} by {interaction.user.display_name}.",
+            "success"
+        )
+        
+        await backup_ch.send(embed=embed, file=file)
+        await interaction.followup.send(f"Backup successfully posted to {backup_ch.mention}.", ephemeral=True)
+
     @app_commands.command(name="setrevealpage", description="[DEV] Set how many trainees are shown per reveal page")
+    @app_commands.describe(size="Number of Trainees shown per reveal page. Must be between 1 and 25.")
     @is_dev()
     async def set_reveal_page(self, interaction: discord.Interaction, size: int):
         if size < 1 or size > 25:
@@ -808,6 +948,10 @@ class ConfigCog(commands.Cog):
         await interaction.response.send_message(embed=get_embed("Success", f"Reveal page size set to {size}.", "success"), ephemeral=True)
 
     @config_group.command(name="setdebutslots", description="[DEV] Set the number of trainees slated to debut")
+    @app_commands.describe(
+        slots="Number of top-ranking positions marked as the debut line.",
+        public="If True, the debut line separator appears during public reveals."
+    )
     @is_dev()
     async def setdebutslots(self, interaction: discord.Interaction, slots: int, public: bool = True):
         data = load_data()
@@ -820,27 +964,79 @@ class ConfigCog(commands.Cog):
         save_data(data)
         await interaction.response.send_message(embed=get_embed("Success", f"Debut line set to top {slots} trainee(s).\nDebut line visibility on public reveals: {public}.", "success"), ephemeral=True)
 
+    @config_group.command(name="votingmultiplier", description="[DEV] Set the vote-to-points multiplier")
+    @app_commands.describe(value="The multiplier applied to votes when closing a voting round. E.g. 2 means each vote is worth 2 points.")
+    @is_dev()
+    async def votingmultiplier(self, interaction: discord.Interaction, value: int):
+        data = load_data()
+        data["voting"]["multiplier"] = value
+        save_data(data)
+        await interaction.response.send_message(embed=get_embed("Success", f"Voting multiplier set to {value}.", "success"), ephemeral=True)
+
+    @config_group.command(name="votingcap", description="[DEV] Set the maximum number of votes per user per round")
+    @app_commands.describe(cap="Maximum votes per user per round. Set to 0 to allow unlimited votes.")
+    @is_dev()
+    async def votingcap(self, interaction: discord.Interaction, cap: int):
+        data = load_data()
+        data["voting"]["cap"] = cap
+        save_data(data)
+        await interaction.response.send_message(embed=get_embed("Success", f"Voting cap set to {cap}.", "success"), ephemeral=True)
+
+    @app_commands.command(name="purgedata", description="[DEV] ⚠️ Permanently wipe ALL bot data and reset to defaults")
+    @is_dev()
+    async def purgedata(self, interaction: discord.Interaction):
+        view = ConfirmPurgeView()
+        msg = await interaction.response.send_message(
+            embed=get_embed(
+                "⚠️ CONFIRM FULL DATA WIPE",
+                "**This will permanently and irreversibly delete:**\n"
+                "• All registered and archived Trainees (OCs)\n"
+                "• All votes, points, and ranking history\n"
+                "• All dorm floors and room assignments\n"
+                "• All mission groups and peer ranking sessions\n"
+                "• All feed posts and grade tiers\n"
+                "• All bot configuration (timezone, channels, roles)\n\n"
+                "**This cannot be undone.** Are you absolutely sure?",
+                "warning"
+            ),
+            view=view,
+            ephemeral=True
+        )
+        view.message = await interaction.original_response()
+
 class RegistrationCog(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
 
     @app_commands.command(name="register", description="Register a new Trainee OC")
+    @app_commands.describe(
+        name="Your Trainee OC's full name. Must be unique among your own OCs.",
+        birthday_yyyy_mm_dd="Date of birth in YYYY-MM-DD format (displayed as YYYY/MM/DD), e.g. 2003-07-14.",
+        gender="Your OC's gender identity, e.g. Female, Male, Non-binary.",
+        pronouns="Your OC's pronouns, e.g. she/her, he/him, they/them.",
+        faceclaim="The real person or character used as the OC's visual reference.",
+        main_skill="Your OC's primary performance skill, e.g. Vocal, Dance, Rap.",
+        nationality="Your OC's country of origin or citizenship.",
+        form_link="(Optional) A link to your OC's full character sheet or application form.",
+        ethnicity="(Optional) Your OC's ethnic background. Defaults to 'Unknown' if omitted.",
+        profile_picture="(Optional) Upload a PNG/JPG/GIF image to use as the OC's profile picture."
+    )
     async def register(self, interaction: discord.Interaction, name: str, birthday_yyyy_mm_dd: str, gender: str, pronouns: str, faceclaim: str, main_skill: str, nationality: str, form_link: str = None, ethnicity: str = "Unknown", profile_picture: discord.Attachment = None):
         data = load_data()
         user_id = str(interaction.user.id)
         current_ocs = len([oc for oc in data["ocs"].values() if oc["owner_id"] == user_id])
         if current_ocs >= data["config"]["oc_cap"]:
-            return await interaction.response.send_message(embed=get_embed("Limit Reached", f"⛔ You've already reached the maximum of {data['config']['oc_cap']} Trainees.", "error"), ephemeral=True)
+            return await interaction.response.send_message(embed=get_embed("Limit Reached", f"⛔ Looks like you've already got {data['config']['oc_cap']} Trainees — that's the maximum allowed right now! Feel free to reach out to a staff member if you have questions.", "error"), ephemeral=True)
         
         for oc in data["ocs"].values():
             if oc["owner_id"] == user_id and oc["name"].lower() == name.lower():
-                return await interaction.response.send_message(embed=get_embed("Duplicate Name", f"⛔ You already have a Trainee named '{name}'. Please use a unique name.", "error"), ephemeral=True)
+                return await interaction.response.send_message(embed=get_embed("Duplicate Name", f"⛔ You've already got a Trainee named **{name}**! Each of your OCs needs a unique name — try a different one.", "error"), ephemeral=True)
 
         if profile_picture:
             if not profile_picture.content_type or not profile_picture.content_type.startswith("image/"):
-                return await interaction.response.send_message(embed=get_embed("Invalid File", "Please attach an image (PNG, JPG, GIF, WEBP).", "error"), ephemeral=True)
+                return await interaction.response.send_message(embed=get_embed("Invalid File", "Hmm, that file type isn't supported. Please attach an image (PNG, JPG, GIF, WEBP)!", "error"), ephemeral=True)
             if not data["config"].get("asset_channel"):
-                return await interaction.response.send_message(embed=get_embed("Warning", "No asset channel has been configured. Ask a Dev to run /setassetchannel first.", "warning"), ephemeral=True)
+                return await interaction.response.send_message(embed=get_embed("Warning", "There's no asset channel set up yet, so profile pictures can't be saved at the moment. A staff member will need to run **/setassetchannel** to enable this — try registering without a picture for now!", "warning"), ephemeral=True)
 
         await interaction.response.defer()
 
@@ -886,22 +1082,24 @@ class RegistrationCog(commands.Cog):
         recalculate_ranks(data)
         
         embed = self._build_profile_embed(new_oc, data)
-        await interaction.followup.send(content="Your Trainee has been registered.", embed=embed)
+        await interaction.followup.send(content="🎉 Welcome to the show! Your Trainee has been registered. Here's their profile:", embed=embed)
 
     @app_commands.command(name="profile", description="View a Trainee's profile")
+    @app_commands.describe(oc_name="The exact name of the Trainee OC to look up.")
     async def profile(self, interaction: discord.Interaction, oc_name: str):
         data = load_data()
         oc = find_oc(oc_name, data)
         if not oc:
-            return await interaction.response.send_message(embed=get_embed("Not Found", f"No Trainee named '{oc_name}' was found.", "error"), ephemeral=True)
+            return await interaction.response.send_message(embed=get_embed("Not Found", f"We looked everywhere but couldn't find a Trainee named '{oc_name}'.", "error"), ephemeral=True)
         await interaction.response.send_message(embed=self._build_profile_embed(oc, data))
 
     @app_commands.command(name="removeoc", description="Archive a Trainee (Irreversible)")
+    @app_commands.describe(oc_name="The name of your Trainee OC to permanently archive. This action cannot be undone.")
     async def removeoc(self, interaction: discord.Interaction, oc_name: str):
         data = load_data()
         oc = find_oc(oc_name, data)
         if not oc or oc["owner_id"] != str(interaction.user.id):
-            return await interaction.response.send_message(embed=get_embed("Error", "OC not found or you don't own them.", "error"), ephemeral=True)
+            return await interaction.response.send_message(embed=get_embed("Error", "Hmm, we couldn't find that Trainee in your roster. Double-check the name and try again!", "error"), ephemeral=True)
         
         if oc.get("dorm_floor") and oc.get("dorm_room"):
             try:
@@ -912,14 +1110,14 @@ class RegistrationCog(commands.Cog):
         data["archived_ocs"][oc["id"]] = oc
         del data["ocs"][oc["id"]]
         recalculate_ranks(data)
-        await interaction.response.send_message(embed=get_embed("OC Archived", f"Trainee '{oc_name}' has been successfully removed.", "success"))
+        await interaction.response.send_message(embed=get_embed("OC Archived", f"**{oc_name}** has been archived and removed from the active roster. Take care! 👋", "success"))
 
     @app_commands.command(name="oc_all", description="Browse all currently registered Trainees")
     async def oc_all(self, interaction: discord.Interaction):
         data = load_data()
         active_ocs = [oc for oc in data["ocs"].values() if not oc.get("eliminated", False)]
         if not active_ocs:
-            return await interaction.response.send_message(embed=get_embed("Empty", "No Trainees are currently registered.", "warning"))
+            return await interaction.response.send_message(embed=get_embed("Empty", "The stage is empty! No Trainees have been registered yet.", "warning"))
             
         active_ocs.sort(key=lambda x: x["name"].lower())
         page_size = data["config"].get("reveal_page_size", 7)
@@ -934,7 +1132,7 @@ class RegistrationCog(commands.Cog):
                 dorm_str = f"{oc['dorm_floor']} · {oc['dorm_room']}" if oc.get('dorm_floor') else "Unassigned"
                 
                 desc = (
-                    f"**Birthday / Age**: {oc['birthday']} · {age} yrs (KST)\n"
+                    f"**Birthday / Age**: {format_date_display(oc['birthday'])} · {age} yrs (KST)\n"
                     f"**Gender / Pronouns**: {oc['gender']} · {oc['pronouns']}\n"
                     f"**Faceclaim**: {oc['faceclaim']}\n"
                     f"**Skill**: {oc['main_skill']}\n"
@@ -962,7 +1160,7 @@ class RegistrationCog(commands.Cog):
         data = load_data()
         eliminated_ocs = [oc for oc in data["ocs"].values() if oc.get("eliminated", False)]
         if not eliminated_ocs:
-            return await interaction.response.send_message(embed=get_embed("None", "No Trainees have been eliminated yet.", "system"))
+            return await interaction.response.send_message(embed=get_embed("None", "Nobody's been eliminated yet — everyone's still in the running! 🌟", "system"))
             
         eliminated_ocs.sort(key=lambda x: x["name"].lower())
         page_size = 25 
@@ -981,6 +1179,10 @@ class RegistrationCog(commands.Cog):
             await interaction.response.send_message(embed=pages[0])
 
     @app_commands.command(name="eliminate", description="[DEV] Eliminate OC(s) from the show")
+    @app_commands.describe(
+        mode="Choose 'By Name' to eliminate a specific OC, or 'By Rank Range' to eliminate a range of rankings.",
+        value="For 'By Name': the OC's exact name. For 'By Rank Range': a number (e.g. 8) or a range (e.g. 8-10)."
+    )
     @app_commands.choices(mode=[
         app_commands.Choice(name="By Name", value="name"),
         app_commands.Choice(name="By Rank Range", value="rank")
@@ -996,7 +1198,7 @@ class RegistrationCog(commands.Cog):
         if mode.value == "name":
             oc = find_oc(value, data)
             if not oc:
-                return await interaction.response.send_message(embed=get_embed("Error", f"No active Trainee named '{value}' found.", "error"), ephemeral=True)
+                return await interaction.response.send_message(embed=get_embed("Error", f"We looked everywhere but couldn't find an active Trainee named '{value}'.", "error"), ephemeral=True)
             if oc.get("eliminated", False):
                 return await interaction.response.send_message(embed=get_embed("Warning", f"{oc['name']} is already eliminated.", "warning"), ephemeral=True)
             target_ocs_list = [oc]
@@ -1060,7 +1262,7 @@ class RegistrationCog(commands.Cog):
             embed.color = COLORS["error"]
 
         age = calculate_age(oc["birthday"])
-        embed.add_field(name="Birthday / Age", value=f"{oc['birthday']} · {age} yrs (KST)", inline=True)
+        embed.add_field(name="Birthday / Age", value=f"{format_date_display(oc['birthday'])} · {age} yrs (KST)", inline=True)
         embed.add_field(name="Gender / Pronouns", value=f"{oc['gender']} · {oc['pronouns']}", inline=True)
         embed.add_field(name="Faceclaim", value=oc["faceclaim"], inline=True)
         embed.add_field(name="Main Skill", value=oc["main_skill"], inline=True)
@@ -1094,7 +1296,7 @@ class VotingCog(commands.Cog):
         self.bot = bot
 
     @app_commands.command(name="vote", description="Cast vote(s) for one or more Trainees (comma-separated names)")
-    @app_commands.describe(oc_names="One or more Trainee names separated by commas, e.g. 'Mira, Juno, Haeun'")
+    @app_commands.describe(oc_names="One or more Trainee names separated by commas. Example: Mira, Juno, Haeun")
     async def vote(self, interaction: discord.Interaction, oc_names: str):
         data = load_data()
 
@@ -1103,7 +1305,7 @@ class VotingCog(commands.Cog):
             return await interaction.response.send_message(
                 embed=get_embed(
                     "Voting Closed",
-                    "Voting is currently closed. Stay tuned for the next evaluation period.",
+                    "Voting isn't open right now! Stay tuned for the next voting round. 🗳️",
                     "error"
                 ),
                 ephemeral=True
@@ -1126,7 +1328,7 @@ class VotingCog(commands.Cog):
             return await interaction.response.send_message(
                 embed=get_embed(
                     "Cap Reached",
-                    f"You have already used all **{cap}** vote(s) for this round.",
+                    "You've used up all your votes for this round! Check back when the next round opens. ✨",
                     "error"
                 ),
                 ephemeral=True
@@ -1137,7 +1339,7 @@ class VotingCog(commands.Cog):
 
         if not raw_names:
             return await interaction.response.send_message(
-                embed=get_embed("No Input", "Please provide at least one Trainee name.", "error"),
+                embed=get_embed("No Input", "Please provide at least one Trainee name to vote for!", "error"),
                 ephemeral=True
             )
 
@@ -1153,7 +1355,7 @@ class VotingCog(commands.Cog):
             # OC resolution
             oc = find_oc(token, data)
             if not oc:
-                rejected.append((token, "Trainee not found"))
+                rejected.append((token, "Hmm, we couldn't find a Trainee with that name. Check the spelling and try again!"))
                 continue
 
             # Eligibility check
@@ -1212,7 +1414,7 @@ class VotingCog(commands.Cog):
         data["voting"]["votes"] = {}
         data["voting"]["start_time"] = now().isoformat()
         save_data(data)
-        await interaction.response.send_message(embed=get_embed("Voting Opened", "The voting round is now LIVE.", "success"))
+        await interaction.response.send_message(embed=get_embed("Voting Opened", "🗳️ Voting is now open! Members can start casting their votes.", "success"))
 
     @app_commands.command(name="votingclose", description="Close voting, apply multiplier & tally (Dev only)")
     @is_dev()
@@ -1258,16 +1460,21 @@ class VotingCog(commands.Cog):
         channel_id = data["config"]["announcement_channel_id"]
         if channel_id:
             channel = self.bot.get_channel(int(channel_id))
-            embed = get_embed("Voting Closed", "The evaluation period has ended. The votes have been tallied and rankings updated.", "system", show_footer=True)
+            embed = get_embed("Voting Closed", "✅ Voting has closed! Results have been tallied and rankings are updated.", "system", show_footer=True)
             await channel.send(embed=embed)
         
-        await interaction.followup.send(embed=get_embed("Success", "Voting closed and tallied.", "success"))
+        await interaction.followup.send(embed=get_embed("Success", "✅ Voting has closed! Results have been tallied and rankings are updated.", "success"))
 
 class PointsCog(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
 
     @app_commands.command(name="points", description="Manage a Trainee's points (Dev only)")
+    @app_commands.describe(
+        oc_name="The name of the Trainee to modify points for.",
+        action="The operation to apply: Add, Deduct, Multiply, or Set.",
+        value="The numeric value for the selected action. Must be a positive number."
+    )
     @app_commands.choices(action=[
         app_commands.Choice(name="Add", value="add"),
         app_commands.Choice(name="Deduct", value="deduct"),
@@ -1279,7 +1486,7 @@ class PointsCog(commands.Cog):
         data = load_data()
         oc = find_oc(oc_name, data)
         if not oc:
-            return await interaction.response.send_message("OC not found.", ephemeral=True)
+            return await interaction.response.send_message("We looked everywhere but couldn't find that Trainee.", ephemeral=True)
         
         points_before = oc["total_points"]
         
@@ -1371,6 +1578,10 @@ class GradesCog(commands.Cog):
         self.bot = bot
 
     @app_commands.command(name="grade_create", description="Create a new grade tier (Dev only)")
+    @app_commands.describe(
+        label="A short display name for the grade tier, e.g. 'A', 'S+', 'Rookie'.",
+        hex_color="A hex color code for this grade's display color. Format: #RRGGBB, e.g. #FFD700."
+    )
     @is_dev()
     async def grade_create(self, interaction: discord.Interaction, label: str, hex_color: str):
         if not hex_color.startswith("#") or len(hex_color) != 7:
@@ -1381,12 +1592,18 @@ class GradesCog(commands.Cog):
         await interaction.response.send_message(embed=get_embed("Grade Created", f"Grade **{label}** created with color {hex_color}.", "success"), ephemeral=True)
 
     @app_commands.command(name="assigngrade", description="Assign a grade to an OC (Dev only)")
+    @app_commands.describe(
+        oc_name="The Trainee OC to assign the grade to.",
+        grade_label="The exact label of the grade tier to assign."
+    )
     @is_dev()
     async def assigngrade(self, interaction: discord.Interaction, oc_name: str, grade_label: str):
         data = load_data()
         oc = find_oc(oc_name, data)
-        if not oc or grade_label not in data["grades"]:
-            return await interaction.response.send_message(embed=get_embed("Error", "OC or Grade not found.", "error"), ephemeral=True)
+        if not oc:
+            return await interaction.response.send_message(embed=get_embed("Not Found", "We looked everywhere but couldn't find that Trainee.", "error"), ephemeral=True)
+        if grade_label not in data["grades"]:
+            return await interaction.response.send_message(embed=get_embed("Not Found", "We couldn't find a grade tier with that label. Use **/grade_create** to create it first!", "error"), ephemeral=True)
         
         oc["grade"] = grade_label
         save_data(data)
@@ -1397,6 +1614,7 @@ class DormsCog(commands.Cog):
         self.bot = bot
 
     @app_commands.command(name="dorm_createfloor", description="Create a dorm floor and its Discord category (Dev only)")
+    @app_commands.describe(floor_name="A unique name for this dorm floor, e.g. 'Floor A' or 'Wing Crimson'. A matching Discord category will be created.")
     @is_dev()
     async def createfloor(self, interaction: discord.Interaction, floor_name: str):
         await interaction.response.defer(ephemeral=True)
@@ -1442,6 +1660,11 @@ class DormsCog(commands.Cog):
         )
 
     @app_commands.command(name="dorm_createroom", description="Create a room on a floor and its Discord channel (Dev only)")
+    @app_commands.describe(
+        floor_name="The name of the floor this room belongs to. Must already exist.",
+        room_name="A unique name for the room within this floor, e.g. 'Room 101'.",
+        capacity="Maximum number of OCs this room can hold."
+    )
     @is_dev()
     async def createroom(
         self,
@@ -1478,8 +1701,6 @@ class DormsCog(commands.Cog):
         category_id = data["dorms"][floor_name].get("category_id")
         if category_id:
             category = interaction.guild.get_channel(int(category_id))
-            # If the category was manually deleted in Discord, proceed without it
-            # and log a warning in the response so the dev is aware.
 
         # Sanitise the room name for a Discord channel slug
         safe_name = re.sub(r'[^a-z0-9\-]', '', room_name.lower().replace(' ', '-'))[:100]
@@ -1526,11 +1747,16 @@ class DormsCog(commands.Cog):
         )
 
     @app_commands.command(name="dorm_assign", description="Manually assign an OC to a room (Dev only)")
+    @app_commands.describe(
+        oc_name="The Trainee OC to assign to a room.",
+        floor_name="The floor the target room is on.",
+        room_name="The room to assign the OC to."
+    )
     @is_dev()
     async def assign(self, interaction: discord.Interaction, oc_name: str, floor_name: str, room_name: str):
         data = load_data()
         oc = find_oc(oc_name, data)
-        if not oc: return await interaction.response.send_message("OC not found.", ephemeral=True)
+        if not oc: return await interaction.response.send_message("We looked everywhere but couldn't find that Trainee.", ephemeral=True)
         
         if oc.get("eliminated", False):
             return await interaction.response.send_message(
@@ -1541,12 +1767,13 @@ class DormsCog(commands.Cog):
         try:
             room = data["dorms"][floor_name]["rooms"][room_name]
             if len(room["occupants"]) >= room["capacity"]:
-                return await interaction.response.send_message(embed=get_embed("Room Full", f"Room {room_name} is at capacity ({room['capacity']}).", "error"), ephemeral=True)
+                return await interaction.response.send_message(embed=get_embed("Room Full", "That room is full! Try a different room or ask a Dev to increase capacity.", "error"), ephemeral=True)
             
             if oc.get("dorm_floor") and oc.get("dorm_room"):
-                try:
-                    data["dorms"][oc["dorm_floor"]]["rooms"][oc["dorm_room"]]["occupants"].remove(oc["id"])
-                except: pass
+                return await interaction.response.send_message(
+                    embed=get_embed("Already Assigned", f"**{oc['name']}** is already assigned to a room — they'll need to be moved out first.", "warning"),
+                    ephemeral=True
+                )
                 
             room["occupants"].append(oc["id"])
             oc["dorm_floor"] = floor_name
@@ -1594,6 +1821,10 @@ class MissionGroupCog(commands.Cog):
     missiongroup = app_commands.Group(name="missiongroup", description="[DEV] Mission Group Management")
 
     @missiongroup.command(name="create", description="[DEV] Create a new mission group")
+    @app_commands.describe(
+        name="A unique name for this mission group.",
+        oc_names="Comma-separated names of Trainees to add as founding members."
+    )
     @is_dev()
     async def create(self, interaction: discord.Interaction, name: str, oc_names: str):
         data = load_data()
@@ -1651,14 +1882,18 @@ class MissionGroupCog(commands.Cog):
         await interaction.response.send_message(embed=get_embed(f"Group '{name}' Created", desc, "success"), ephemeral=True)
 
     @missiongroup.command(name="addmember", description="[DEV] Add an OC to a mission group")
+    @app_commands.describe(
+        group_name="The name of the mission group to add a member to.",
+        oc_name="The Trainee OC to add."
+    )
     @is_dev()
     async def addmember(self, interaction: discord.Interaction, group_name: str, oc_name: str):
         data = load_data()
         group = next((mg for mg in data["mission_groups"].values() if not mg.get("archived") and mg["name"].lower() == group_name.lower()), None)
-        if not group: return await interaction.response.send_message(embed=get_embed("Error", "Mission group not found or archived.", "error"), ephemeral=True)
+        if not group: return await interaction.response.send_message(embed=get_embed("Error", "We looked everywhere but couldn't find that mission group.", "error"), ephemeral=True)
         
         oc = find_oc(oc_name, data)
-        if not oc: return await interaction.response.send_message(embed=get_embed("Error", "OC not found.", "error"), ephemeral=True)
+        if not oc: return await interaction.response.send_message(embed=get_embed("Error", "We looked everywhere but couldn't find that Trainee.", "error"), ephemeral=True)
         if oc.get("eliminated"): return await interaction.response.send_message(embed=get_embed("Error", "OC is eliminated.", "error"), ephemeral=True)
         
         conflict = next((mg["name"] for mg in data["mission_groups"].values() if not mg.get("archived") and oc["id"] in mg["members"]), None)
@@ -1669,11 +1904,15 @@ class MissionGroupCog(commands.Cog):
         await interaction.response.send_message(embed=get_embed("Success", f"{oc['name']} added to {group['name']}.", "success"), ephemeral=True)
 
     @missiongroup.command(name="removemember", description="[DEV] Remove an OC from a mission group")
+    @app_commands.describe(
+        group_name="The name of the mission group to remove a member from.",
+        oc_name="The Trainee OC to remove."
+    )
     @is_dev()
     async def removemember(self, interaction: discord.Interaction, group_name: str, oc_name: str):
         data = load_data()
         group = next((mg for mg in data["mission_groups"].values() if not mg.get("archived") and mg["name"].lower() == group_name.lower()), None)
-        if not group: return await interaction.response.send_message(embed=get_embed("Error", "Mission group not found.", "error"), ephemeral=True)
+        if not group: return await interaction.response.send_message(embed=get_embed("Error", "We looked everywhere but couldn't find that mission group.", "error"), ephemeral=True)
         
         oc = find_oc(oc_name, data)
         if not oc or oc["id"] not in group["members"]:
@@ -1684,12 +1923,16 @@ class MissionGroupCog(commands.Cog):
         await interaction.response.send_message(embed=get_embed("Success", f"{oc['name']} removed from {group['name']}.", "success"), ephemeral=True)
 
     @missiongroup.command(name="provision", description="[DEV] Create a Discord practice channel for a group")
+    @app_commands.describe(
+        group_name="The mission group to create a practice channel for.",
+        category="(Optional) The name of an existing Discord category to place the channel in."
+    )
     @is_dev()
     async def provision(self, interaction: discord.Interaction, group_name: str, category: discord.CategoryChannel = None):
         await interaction.response.defer(ephemeral=True)
         data = load_data()
         group = next((mg for mg in data["mission_groups"].values() if not mg.get("archived") and mg["name"].lower() == group_name.lower()), None)
-        if not group: return await interaction.followup.send(embed=get_embed("Error", "Mission group not found or archived.", "error"))
+        if not group: return await interaction.followup.send(embed=get_embed("Error", "We looked everywhere but couldn't find that mission group.", "error"))
         
         if group.get("channel_id"):
             ch = self.bot.get_channel(int(group["channel_id"]))
@@ -1711,12 +1954,13 @@ class MissionGroupCog(commands.Cog):
         await interaction.followup.send(embed=get_embed("Success", f"Practice room created: <#{channel.id}>.", "success"))
 
     @missiongroup.command(name="deprovision", description="[DEV] Delete the practice channel for a group")
+    @app_commands.describe(group_name="The name of the mission group to deprovision.")
     @is_dev()
     async def deprovision(self, interaction: discord.Interaction, group_name: str):
         data = load_data()
         group = next((mg for mg in data["mission_groups"].values() if mg["name"].lower() == group_name.lower()), None)
         if not group or not group.get("channel_id"):
-            return await interaction.response.send_message(embed=get_embed("Error", "Group not found or has no channel.", "error"), ephemeral=True)
+            return await interaction.response.send_message(embed=get_embed("Error", "We looked everywhere but couldn't find that mission group, or it has no channel.", "error"), ephemeral=True)
             
         ch = self.bot.get_channel(int(group["channel_id"]))
         if ch:
@@ -1735,7 +1979,7 @@ class MissionGroupCog(commands.Cog):
         data = load_data()
         if group_name:
             group = next((mg for mg in data["mission_groups"].values() if not mg.get("archived") and mg["name"].lower() == group_name.lower()), None)
-            if not group: return await interaction.response.send_message(embed=get_embed("Error", "Group not found.", "error"))
+            if not group: return await interaction.response.send_message(embed=get_embed("Error", "We looked everywhere but couldn't find that mission group.", "error"))
             
             embed = get_embed(f"Mission Group: {group['name']}", f"**Created**: {format_dt(group['created_at'])}")
             embed.add_field(name="Practice Room", value=f"<#{group['channel_id']}>" if group.get("channel_id") else "No practice room", inline=False)
@@ -1764,11 +2008,12 @@ class MissionGroupCog(commands.Cog):
             await interaction.response.send_message(embed=embeds[0])
 
     @missiongroup.command(name="archive", description="[DEV] Archive a mission group")
+    @app_commands.describe(group_name="The name of the mission group to archive.")
     @is_dev()
     async def archive(self, interaction: discord.Interaction, group_name: str):
         data = load_data()
         group = next((mg for mg in data["mission_groups"].values() if not mg.get("archived") and mg["name"].lower() == group_name.lower()), None)
-        if not group: return await interaction.response.send_message(embed=get_embed("Error", "Group not found.", "error"), ephemeral=True)
+        if not group: return await interaction.response.send_message(embed=get_embed("Error", "We looked everywhere but couldn't find that mission group.", "error"), ephemeral=True)
         
         group["archived"] = True
         save_data(data)
@@ -1783,6 +2028,7 @@ class PeerRankingCog(commands.Cog):
     peerranking = app_commands.Group(name="peerranking", description="Peer Ranking System")
 
     @peerranking.command(name="toggle", description="[DEV] Toggle Peer Ranking system on/off")
+    @app_commands.describe(enabled="Set to True to enable the peer ranking system, False to disable it globally.")
     @is_dev()
     async def toggle(self, interaction: discord.Interaction, enabled: bool):
         data = load_data()
@@ -1795,6 +2041,13 @@ class PeerRankingCog(commands.Cog):
         await interaction.response.send_message(embed=get_embed("System Toggled", f"Peer Ranking System is now {'**ENABLED**' if enabled else '**DISABLED**'}.{warning}", "success" if enabled else "warning"), ephemeral=True)
 
     @peerranking.command(name="configure", description="[DEV] Configure Peer Ranking rewards/penalties")
+    @app_commands.describe(
+        benefit_type="Reward type for the top-ranked OC: 'multiplier' scales points, 'flat' adds a fixed amount.",
+        benefit_value="The numeric value of the reward (e.g. 1.20 for a 20% bonus multiplier).",
+        penalty_type="Penalty type for the bottom-ranked OC: 'multiplier' or 'flat'.",
+        penalty_value="The numeric value of the penalty.",
+        transparent="If True, the resolved results are posted publicly. Default: True."
+    )
     @app_commands.choices(benefit_type=[app_commands.Choice(name="Multiplier", value="multiplier"), app_commands.Choice(name="Flat Points", value="flat")],
                           penalty_type=[app_commands.Choice(name="Multiplier", value="multiplier"), app_commands.Choice(name="Flat Points", value="flat")])
     @is_dev()
@@ -1821,6 +2074,7 @@ class PeerRankingCog(commands.Cog):
         await interaction.response.send_message(embed=get_embed("Configuration Updated", desc, "success"), ephemeral=True)
 
     @peerranking.command(name="opensession", description="[DEV] Open a new peer ranking session")
+    @app_commands.describe(mission_group="The mission group whose members will be ranked against each other.")
     @is_dev()
     async def opensession(self, interaction: discord.Interaction, mission_group: str):
         data = load_data()
@@ -1831,7 +2085,7 @@ class PeerRankingCog(commands.Cog):
             return await interaction.response.send_message(embed=get_embed("Error", "An active peer ranking session already exists. Close it before opening a new one.", "error"), ephemeral=True)
 
         group = next((mg for mg in data["mission_groups"].values() if not mg.get("archived") and mg["name"].lower() == mission_group.lower()), None)
-        if not group: return await interaction.response.send_message(embed=get_embed("Error", "Mission group not found.", "error"), ephemeral=True)
+        if not group: return await interaction.response.send_message(embed=get_embed("Error", "We looked everywhere but couldn't find that mission group.", "error"), ephemeral=True)
 
         perf_oc_ids = [oid for oid in group["members"] if oid in data["ocs"] and not data["ocs"][oid].get("eliminated")]
         if not perf_oc_ids: return await interaction.response.send_message(embed=get_embed("Error", "No active trainees in this group.", "error"), ephemeral=True)
@@ -1864,21 +2118,25 @@ class PeerRankingCog(commands.Cog):
         await interaction.response.send_message(embed=get_embed("Success", f"Session opened. {len(eligible)} eligible voters.", "success"), ephemeral=True)
 
     @peerranking.command(name="vote", description="Cast your peer ranking vote (best to worst)")
-    async def vote(self, interaction: discord.Interaction, ranking: str):
+    @app_commands.describe(
+        session_id="The ID of the currently open peer ranking session.",
+        ranking="A comma-separated list of OC names ordered from best to worst performer in your opinion."
+    )
+    async def vote(self, interaction: discord.Interaction, session_id: str, ranking: str):
         data = load_data()
         if not data["config"]["peer_ranking_enabled"]:
-            return await interaction.response.send_message(embed=get_embed("Disabled", "Peer Ranking is currently disabled.", "error"), ephemeral=True)
+            return await interaction.response.send_message(embed=get_embed("Disabled", "The Rivalry Protocol is not active this cycle.", "error"), ephemeral=True)
             
         session = next((s for s in data["peer_ranking_sessions"].values() if not s.get("resolved")), None)
-        if not session:
+        if not session or session["session_id"] != session_id:
             return await interaction.response.send_message(embed=get_embed("Closed", "No peer ranking session is currently open.", "error"), ephemeral=True)
             
         user_id = str(interaction.user.id)
         if user_id not in session["eligible_voter_ids"]:
-            return await interaction.response.send_message(embed=get_embed("Ineligible", "You are not eligible to vote in this session. Only trainees who were not performing may cast peer rankings.", "error"), ephemeral=True)
+            return await interaction.response.send_message(embed=get_embed("Ineligible", "You aren't eligible to vote in this session. Only trainees who were not performing may cast peer rankings.", "error"), ephemeral=True)
             
         if user_id in session["ballots"]:
-            return await interaction.response.send_message(embed=get_embed("Already Voted", "You have already submitted your ranking for this session.", "warning"), ephemeral=True)
+            return await interaction.response.send_message(embed=get_embed("Already Voted", "You've already submitted your ranking for this session!", "warning"), ephemeral=True)
             
         raw_names = [n.strip() for n in re.split(r'[,\s]+', ranking) if n.strip()]
         perf_lower_map = {data["ocs"][oid]["name"].lower(): oid for oid in session["performing_oc_ids"]}
@@ -1895,14 +2153,14 @@ class PeerRankingCog(commands.Cog):
             
         session["ballots"][user_id] = ballot_ids
         save_data(data)
-        await interaction.response.send_message(embed=get_embed("Recorded", "Your peer ranking has been recorded. It will remain private until the session is revealed.", "success"), ephemeral=True)
+        await interaction.response.send_message(embed=get_embed("Recorded", "Your peer ranking has been recorded. It will remain private until the session is revealed. 🤫", "success"), ephemeral=True)
 
     @peerranking.command(name="closesession", description="[DEV] Close session and apply multipliers")
     @is_dev()
     async def closesession(self, interaction: discord.Interaction):
         data = load_data()
         session = next((s for s in data["peer_ranking_sessions"].values() if not s.get("resolved")), None)
-        if not session: return await interaction.response.send_message(embed=get_embed("Error", "No active session to close.", "error"), ephemeral=True)
+        if not session: return await interaction.response.send_message(embed=get_embed("Error", "We looked everywhere but couldn't find an active session to close.", "error"), ephemeral=True)
 
         perf_oc_ids = session["performing_oc_ids"]
         tally = {oid: 0 for oid in perf_oc_ids}
@@ -2126,7 +2384,6 @@ class RankingsCog(commands.Cog):
             return await channel.send(embed=get_embed("No Results", "No trainees found in that rank range.", "warning"))
             
         page_size = data["config"].get("reveal_page_size", 7)
-        # We set show_debut_line to False for partial reveals since ordinal counting might misalign with partial lists
         page_embeds = await _run_sequential_reveal(channel, active_ocs, color, page_size, data, show_debut_line=False)
         
         await interaction.followup.send(
@@ -2229,7 +2486,6 @@ class HelpCog(commands.Cog):
     async def help_cmd(self, interaction: discord.Interaction, section: app_commands.Choice[str] = None):
         try:
             if section is None:
-                # Build the index overview page
                 embed = get_embed(
                     "Survival Show Sim — Command Guide",
                     "Use `/guide section:<name>` to drill into any topic.\n\u200b",
@@ -2249,7 +2505,6 @@ class HelpCog(commands.Cog):
                     )
                 return await interaction.response.send_message(embed=embed, ephemeral=True)
 
-            # Specific section page
             sec = HELP_SECTIONS[section.value]
             
             if not sec["commands"] and not sec["dev_commands"]:
@@ -2285,9 +2540,13 @@ class FeedCog(commands.Cog):
 
     @feed_group.command(name="post", description="Post to an OC's social feed (up to 10 media)")
     @app_commands.describe(
-        oc_name="Name of the OC",
-        caption="Caption text (max 500 characters)",
-        media1="First image or video attachment (required)"
+        oc_name="The name of the OC posting to their feed.",
+        caption="The text caption for this post.",
+        media1="URL to the first image or video attachment.",
+        media2="(Optional) URL to a second media attachment.",
+        media3="(Optional) URL to a third media attachment.",
+        media4="(Optional) URL to a fourth media attachment.",
+        media5="(Optional) URL to a fifth media attachment."
     )
     async def feed_post(self, interaction: discord.Interaction, oc_name: str, caption: str,
                         media1: discord.Attachment, media2: discord.Attachment = None, media3: discord.Attachment = None,
@@ -2299,9 +2558,9 @@ class FeedCog(commands.Cog):
         oc = next((o for o in data["ocs"].values() if o["name"].lower() == oc_name.lower()), None)
         
         if not oc:
-            return await interaction.response.send_message(embed=get_embed("Not Found", f"No active Trainee named '{oc_name}'.", "error"), ephemeral=True)
+            return await interaction.response.send_message(embed=get_embed("Not Found", f"We looked everywhere but couldn't find an active Trainee named '{oc_name}'.", "error"), ephemeral=True)
         if oc.get("eliminated", False):
-            return await interaction.response.send_message(embed=get_embed("Ineligible", "Eliminated Trainees cannot post to their feed.", "error"), ephemeral=True)
+            return await interaction.response.send_message(embed=get_embed("Ineligible", "Eliminated Trainees aren't able to post to their feed right now.", "error"), ephemeral=True)
             
         is_owner = str(interaction.user.id) == oc["owner_id"]
         dev_role = data["config"].get("dev_role_id")
@@ -2312,7 +2571,7 @@ class FeedCog(commands.Cog):
         )
         
         if not is_owner and not is_dev_user:
-            return await interaction.response.send_message(embed=get_embed("Permission Denied", "🔒 Only this OC's owner or a staff member can post to this feed.", "error"), ephemeral=True)
+            return await interaction.response.send_message(embed=get_embed("Permission Denied", f"🔒 Only **{oc['name']}**'s owner or a staff member can do that!", "error"), ephemeral=True)
             
         oc_id = oc["id"]
         if oc_id not in data["feeds"]:
@@ -2322,20 +2581,20 @@ class FeedCog(commands.Cog):
             return await interaction.response.send_message(embed=get_embed("Feed Full", f"**{oc['name']}** already has 10 posts. Delete an existing post with `/feed delete` to make room.", "warning"), ephemeral=True)
             
         if len(caption) > 500:
-            return await interaction.response.send_message(embed=get_embed("Caption Too Long", "Captions must be 500 characters or fewer.", "error"), ephemeral=True)
+            return await interaction.response.send_message(embed=get_embed("Caption Too Long", "Your caption is a bit too long! Please keep it under 500 characters.", "error"), ephemeral=True)
             
         raw_attachments = [a for a in [media1, media2, media3, media4, media5, media6, media7, media8, media9, media10] if a is not None]
         
         ALLOWED_TYPES = ("image/", "video/")
         for att in raw_attachments:
             if not att.content_type or not any(att.content_type.startswith(t) for t in ALLOWED_TYPES):
-                return await interaction.response.send_message(embed=get_embed("Invalid File", f"'{att.filename}' is not a supported image or video type.", "error"), ephemeral=True)
+                return await interaction.response.send_message(embed=get_embed("Invalid File", f"Hmm, '{att.filename}' isn't a supported image or video type.", "error"), ephemeral=True)
                 
         if not data["config"].get("asset_channel"):
-            return await interaction.response.send_message(embed=get_embed("Not Configured", "No asset channel set. Ask a Dev to run `/setassetchannel`.", "warning"), ephemeral=True)
+            return await interaction.response.send_message(embed=get_embed("Not Configured", "There's no asset channel set up yet, so profile pictures can't be saved at the moment. A staff member will need to run **/setassetchannel** to enable this — try registering without a picture for now!", "warning"), ephemeral=True)
             
         if not data["config"].get("feed_channel"):
-            return await interaction.response.send_message(embed=get_embed("Not Configured", "No feed channel set. Ask a Dev to run `/setfeedchannel`.", "warning"), ephemeral=True)
+            return await interaction.response.send_message(embed=get_embed("Not Configured", "The feed channel hasn't been set up yet. A Dev needs to run `/setfeedchannel`.", "warning"), ephemeral=True)
             
         await interaction.response.defer()
         
@@ -2397,19 +2656,20 @@ class FeedCog(commands.Cog):
         oc.setdefault("feed_post_ids", []).append(post_id)
         save_data(data)
         
-        await interaction.followup.send(embed=get_embed("Post Published", f"**{oc['name']}**'s post has been published to <#{feed_ch.id}>.", "success"), ephemeral=True)
+        await interaction.followup.send(embed=get_embed("Post Published", f"📸 **{oc['name']}**'s post is live! Head over to <#{feed_ch.id}> to check it out.", "success"), ephemeral=True)
 
     @feed_group.command(name="view", description="Browse an OC's social feed posts")
+    @app_commands.describe(oc_name="The OC whose feed you want to browse.")
     async def feed_view(self, interaction: discord.Interaction, oc_name: str):
         data = load_data()
         oc = next((o for o in data["ocs"].values() if o["name"].lower() == oc_name.lower()), None)
         
         if not oc:
-            return await interaction.response.send_message(embed=get_embed("Not Found", f"No Trainee named '{oc_name}'.", "error"), ephemeral=True)
+            return await interaction.response.send_message(embed=get_embed("Not Found", f"We looked everywhere but couldn't find a Trainee named '{oc_name}'.", "error"), ephemeral=True)
             
         oc_posts = data["feeds"].get(oc["id"], [])
         if not oc_posts:
-            return await interaction.response.send_message(embed=get_embed(f"{oc['name']}'s Feed", "No posts yet.", "system"))
+            return await interaction.response.send_message(embed=get_embed(f"{oc['name']}'s Feed", f"Nothing here yet — **{oc['name']}** hasn't posted anything! 📭", "system"))
             
         pages = []
         grade_color = COLORS["system"]
@@ -2449,11 +2709,15 @@ class FeedCog(commands.Cog):
             view.message = msg
             
     @feed_group.command(name="delete", description="Delete one of an OC's feed posts by its number (1 = oldest)")
+    @app_commands.describe(
+        oc_name="The OC whose post you want to delete.",
+        post_number="The number of the post to delete (1 = oldest post)."
+    )
     async def feed_delete(self, interaction: discord.Interaction, oc_name: str, post_number: int):
         data = load_data()
         oc = next((o for o in data["ocs"].values() if o["name"].lower() == oc_name.lower()), None)
         if not oc:
-            return await interaction.response.send_message(embed=get_embed("Not Found", f"No Trainee named '{oc_name}'.", "error"), ephemeral=True)
+            return await interaction.response.send_message(embed=get_embed("Not Found", f"We looked everywhere but couldn't find a Trainee named '{oc_name}'.", "error"), ephemeral=True)
             
         is_owner = str(interaction.user.id) == oc["owner_id"]
         dev_role = data["config"].get("dev_role_id")
@@ -2463,7 +2727,7 @@ class FeedCog(commands.Cog):
         )
         
         if not is_owner and not is_dev_user:
-            return await interaction.response.send_message(embed=get_embed("Permission Denied", "🔒 Only this OC's owner or a staff member can delete feed posts.", "error"), ephemeral=True)
+            return await interaction.response.send_message(embed=get_embed("Permission Denied", f"🔒 Only **{oc['name']}**'s owner or a staff member can do that!", "error"), ephemeral=True)
             
         oc_posts = data["feeds"].get(oc["id"], [])
         if not (1 <= post_number <= len(oc_posts)):
@@ -2483,7 +2747,7 @@ class FeedCog(commands.Cog):
         oc["feed_post_ids"].pop(post_number - 1)
         save_data(data)
         
-        await interaction.response.send_message(embed=get_embed("Post Deleted", f"Post #{post_number} from **{oc['name']}**'s feed has been removed.", "success"), ephemeral=True)
+        await interaction.response.send_message(embed=get_embed("Post Deleted", f"Post #{post_number} from **{oc['name']}**'s feed has been taken down successfully.", "success"), ephemeral=True)
 
 # ==========================================
 # 6. BACKGROUND TASKS
