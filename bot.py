@@ -2978,8 +2978,8 @@ class RankingsCog(commands.Cog):
             view=RankingPaginationView(page_embeds)
         )
 
-    @app_commands.command(name="rankings_partial", description="Reveal specific rankings by number — supports single values and comma/space-separated lists (e.g. '1 5 9' or '3, 7, 12').")
-    @app_commands.describe(ranks="Rank numbers to reveal. Accepts space-separated or comma-separated integers, or a mix. E.g.: '1 3 5' or '2, 8, 14' or '1,2 5 10'.")
+    @app_commands.command(name="rankings_partial", description="Reveal specific rankings by number — supports comma/space-separated lists.")
+    @app_commands.describe(ranks="Rank numbers to reveal. Accepts space-separated or comma-separated integers, or a mix.")
     @is_dev()
     async def partial(self, interaction: discord.Interaction, ranks: str):
         data = load_data()
