@@ -96,6 +96,7 @@ HELP_SECTIONS = {
             ("/points", "oc_name action value", "🔒 Add, Deduct, Multiply, or Set a Trainee's mission points."),
             ("/resetallpoints", "", "🔒 Zero all OC points and anchor a new ranking baseline snapshot. Requires voting to be closed first."),
             ("/rankings_private", "", "🔒 See all current rankings privately. Bypasses open/closed voting gate. Shows live tally with pagination."),
+            ("/rankings_partial", "ranks", "🔒 Reveal specific rankings by number. Accepts space- or comma-separated integers (e.g. `1 5 9` or `3, 7, 12`)."),
             ("/export_rankings", "", "🔒 Export full state (rankings, history, logs, feeds) as a CSV file."),
         ]
     },
@@ -161,7 +162,7 @@ HELP_SECTIONS = {
         "title": "⚙️ Configuration",
         "commands": [],
         "dev_commands": [
-            ("/setup", "timezone announce_channel dev_role [asset_channel]", "🔒 Initial bot setup."),
+            ("/setup", "timezone announce_channel", "🔒 Initial bot setup. Dev role, asset channel, and data channel are resolved automatically."),
             ("/config_view", "", "🔒 View all current configuration values."),
             ("/setassetchannel", "channel", "🔒 Set the persistent asset storage channel."),
             ("/setfeedchannel", "channel", "🔒 Set the public feed channel."),
@@ -230,6 +231,91 @@ DEFAULT_SCHEMA = {
 # ==========================================
 # 2. DATA MANAGEMENT (ATOMIC WRITES)
 # ==========================================
+def migrate_schema(data: dict) -> bool:
+    modified = False
+    for key, val in DEFAULT_SCHEMA.items():
+        if key not in data:
+            data[key] = val
+            modified = True
+            
+    for key, val in DEFAULT_SCHEMA["config"].items():
+        if key not in data["config"]:
+            data["config"][key] = val
+            modified = True
+
+    if "last_closed_at" not in data["voting"]:
+        data["voting"]["last_closed_at"] = None
+        modified = True
+    if "user_votes" not in data["voting"]:
+        data["voting"]["user_votes"] = {}
+        modified = True
+    if "scheduled_open_time" not in data["voting"]:
+        data["voting"]["scheduled_open_time"] = None
+        modified = True
+    if "scheduled_close_time" not in data["voting"]:
+        data["voting"]["scheduled_close_time"] = None
+        modified = True
+    if "daily_vote_counts" not in data["voting"]:
+        data["voting"]["daily_vote_counts"] = {}
+        modified = True
+    if "daily_vote_date" not in data["voting"]:
+        data["voting"]["daily_vote_date"] = None
+        modified = True
+        
+    if "feeds" not in data:
+        data["feeds"] = {}
+        modified = True
+
+    for oc in data.get("ocs", {}).values():
+        if "profile_picture_url" not in oc:
+            oc["profile_picture_url"] = None
+            modified = True
+        if "eliminated" not in oc:
+            oc["eliminated"] = False
+            modified = True
+        if "feed_post_ids" not in oc:
+            oc["feed_post_ids"] = []
+            modified = True
+        if "birthday" not in oc:
+            oc["birthday"] = "Unknown"
+            modified = True
+        if "form_link" not in oc:
+            oc["form_link"] = None
+            modified = True
+            
+    for oc in data.get("archived_ocs", {}).values():
+        if "profile_picture_url" not in oc:
+            oc["profile_picture_url"] = None
+            modified = True
+        if "eliminated" not in oc:
+            oc["eliminated"] = False
+            modified = True
+        if "feed_post_ids" not in oc:
+            oc["feed_post_ids"] = []
+            modified = True
+        if "birthday" not in oc:
+            oc["birthday"] = "Unknown"
+            modified = True
+        if "form_link" not in oc:
+            oc["form_link"] = None
+            modified = True
+
+    for floor_name, floor_data in data.get("dorms", {}).items():
+        if "category_id" not in floor_data:
+            floor_data["category_id"] = None
+            modified = True
+        for room_name, room_data in floor_data.get("rooms", {}).items():
+            if "channel_id" not in room_data:
+                room_data["channel_id"] = None
+                modified = True
+                
+    for grade_label, grade_data in data.get("grades", {}).items():
+        if "role_id" not in grade_data:
+            grade_data["role_id"] = None
+            modified = True
+
+    return modified
+
 def load_data():
     if not os.path.exists(DATA_FILE):
         with open(DATA_FILE, "w", encoding="utf-8") as f:
@@ -240,103 +326,44 @@ def load_data():
     try:
         with open(DATA_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
-            modified = False
-            
-            # Auto-initialize missing top-level keys
-            for key, val in DEFAULT_SCHEMA.items():
-                if key not in data:
-                    data[key] = val
-                    modified = True
-            
-            # Auto-initialize missing config sub-keys
-            for key, val in DEFAULT_SCHEMA["config"].items():
-                if key not in data["config"]:
-                    data["config"][key] = val
-                    modified = True
-
-            # Voting schema migration
-            if "last_closed_at" not in data["voting"]:
-                data["voting"]["last_closed_at"] = None
-                modified = True
-            if "user_votes" not in data["voting"]:
-                data["voting"]["user_votes"] = {}
-                modified = True
-            if "scheduled_open_time" not in data["voting"]:
-                data["voting"]["scheduled_open_time"] = None
-                modified = True
-            if "scheduled_close_time" not in data["voting"]:
-                data["voting"]["scheduled_close_time"] = None
-                modified = True
-            if "daily_vote_counts" not in data["voting"]:
-                data["voting"]["daily_vote_counts"] = {}
-                modified = True
-            if "daily_vote_date" not in data["voting"]:
-                data["voting"]["daily_vote_date"] = None
-                modified = True
-            
-            # Feeds initialization
-            if "feeds" not in data:
-                data["feeds"] = {}
-                modified = True
-
-            # Schema Migration Guard for OCs
-            for oc in data.get("ocs", {}).values():
-                if "profile_picture_url" not in oc:
-                    oc["profile_picture_url"] = None
-                    modified = True
-                if "eliminated" not in oc:
-                    oc["eliminated"] = False
-                    modified = True
-                if "feed_post_ids" not in oc:
-                    oc["feed_post_ids"] = []
-                    modified = True
-                if "birthday" not in oc:
-                    oc["birthday"] = "Unknown"
-                    modified = True
-                if "form_link" not in oc:
-                    oc["form_link"] = None
-                    modified = True
-            
-            # Schema Migration Guard for Archived OCs
-            for oc in data.get("archived_ocs", {}).values():
-                if "profile_picture_url" not in oc:
-                    oc["profile_picture_url"] = None
-                    modified = True
-                if "eliminated" not in oc:
-                    oc["eliminated"] = False
-                    modified = True
-                if "feed_post_ids" not in oc:
-                    oc["feed_post_ids"] = []
-                    modified = True
-                if "birthday" not in oc:
-                    oc["birthday"] = "Unknown"
-                    modified = True
-                if "form_link" not in oc:
-                    oc["form_link"] = None
-                    modified = True
-
-            # Schema Migration Guard for Dorms: add category_id and room channel_id
-            for floor_name, floor_data in data.get("dorms", {}).items():
-                if "category_id" not in floor_data:
-                    floor_data["category_id"] = None
-                    modified = True
-                for room_name, room_data in floor_data.get("rooms", {}).items():
-                    if "channel_id" not in room_data:
-                        room_data["channel_id"] = None
-                        modified = True
-                        
-            # Schema Migration Guard for Grades: add role_id
-            for grade_label, grade_data in data.get("grades", {}).items():
-                if "role_id" not in grade_data:
-                    grade_data["role_id"] = None
-                    modified = True
-
+            modified = migrate_schema(data)
             if modified:
                 save_data(data)
             return data
     except json.JSONDecodeError:
         print("CRITICAL ERROR: JSON is malformed. Halting to prevent data overwrite.")
         os._exit(1)
+
+async def load_data_from_channel(bot_instance: discord.Client):
+    data = load_data()
+    channel_id = data["config"].get("data_channel_id")
+    if not channel_id:
+        return data
+        
+    channel = bot_instance.get_channel(int(channel_id))
+    if not channel:
+        return data
+        
+    try:
+        async for message in channel.history(limit=50, oldest_first=False):
+            for attachment in message.attachments:
+                if attachment.filename.endswith(".json"):
+                    json_bytes = await attachment.read()
+                    fetched_data = json.loads(json_bytes)
+                    
+                    migrate_schema(fetched_data)
+                    
+                    # Persist locally
+                    with open(TEMP_FILE, "w", encoding="utf-8") as f:
+                        json.dump(fetched_data, f, indent=4)
+                    os.replace(TEMP_FILE, DATA_FILE)
+                    
+                    print(f"Successfully rehydrated data from #{channel.name} ({attachment.filename})")
+                    return fetched_data
+    except Exception as e:
+        print(f"Failed to hydrate from channel: {e}")
+        
+    return data
 
 def save_data(data: dict, reason: str = "routine update", actor: discord.User | discord.Member | None = None):
     with open(TEMP_FILE, "w", encoding="utf-8") as f:
@@ -366,9 +393,8 @@ async def notify_data_channel(data: dict, reason: str, actor: discord.User | dis
             embed.set_footer(text="data.json written")
             
             json_bytes = json.dumps(data, indent=4, ensure_ascii=False).encode("utf-8")
-            timestamp_str = now().strftime("%Y-%m-%d_%H-%M-%S")
-            safe_reason = re.sub(r'[^a-zA-Z0-9_\-]', '_', reason)[:40]
-            filename = f"data_{timestamp_str}_{safe_reason}.json"
+            timestamp_str = datetime.now(KST).strftime('%Y%m%d_%H%M%S')
+            filename = f"data_{timestamp_str}.json"
             data_file = discord.File(fp=io.BytesIO(json_bytes), filename=filename)
             
             await channel.send(embed=embed, file=data_file)
@@ -430,6 +456,35 @@ async def sync_grade_role_for_owner(
 # ==========================================
 # 3. UTILITY FUNCTIONS & SHARED VIEWS
 # ==========================================
+async def auto_resolve_config(guild: discord.Guild | None, data: dict) -> bool:
+    if not guild:
+        return False
+    changed = False
+    
+    if data["config"].get("asset_channel") is None:
+        channel = discord.utils.get(guild.text_channels, name="assets")
+        if not channel:
+            channel = next((c for c in guild.text_channels if c.name.lower() == "assets"), None)
+        if channel:
+            data["config"]["asset_channel"] = channel.id
+            changed = True
+
+    if data["config"].get("data_channel_id") is None:
+        channel = discord.utils.get(guild.text_channels, name="data")
+        if not channel:
+            channel = next((c for c in guild.text_channels if c.name.lower() == "data"), None)
+        if channel:
+            data["config"]["data_channel_id"] = channel.id
+            changed = True
+
+    if data["config"].get("dev_role_id") is None:
+        role = next((r for r in guild.roles if r.permissions.administrator and not r.is_default()), None)
+        if role:
+            data["config"]["dev_role_id"] = role.id
+            changed = True
+
+    return changed
+
 def get_tz():
     data = load_data()
     tz_str = data["config"].get("timezone", "UTC")
@@ -504,12 +559,23 @@ def is_dev():
     async def predicate(interaction: discord.Interaction):
         if interaction.user.id == interaction.client.application.owner.id:
             return True
+            
         data = load_data()
+        if await auto_resolve_config(interaction.guild, data):
+            save_data(data, reason="auto_resolve_is_dev", actor=interaction.user)
+            
         dev_role_id = data["config"].get("dev_role_id")
         if dev_role_id:
-            role = interaction.guild.get_role(int(dev_role_id))
-            if role in interaction.user.roles:
+            role = interaction.guild.get_role(int(dev_role_id)) if interaction.guild else None
+            if role and role in interaction.user.roles:
                 return True
+                
+        # Fallback: any Administrator role
+        if interaction.guild:
+            for role in interaction.user.roles:
+                if role.permissions.administrator:
+                    return True
+                    
         raise app_commands.CheckFailure("dev_only")
     return app_commands.check(predicate)
 
@@ -1123,6 +1189,9 @@ class SurvivalBot(commands.Bot):
         await self.add_cog(HelpCog(self))
         await self.add_cog(FeedCog(self))
 
+        await load_data_from_channel(self)
+        asyncio.create_task(self.deferred_auto_resolve())
+
         data = load_data()
         for feed_list in data.get("feeds", {}).values():
             for post in feed_list:
@@ -1132,6 +1201,16 @@ class SurvivalBot(commands.Bot):
         post_count = sum(len(v) for v in data.get("feeds", {}).values())
         print(f"Bot Started & Commands Synced. Loaded {len(data.get('ocs', {}))} OCs, {post_count} feed post(s).")
         voting_scheduler.start()
+
+    async def deferred_auto_resolve(self):
+        await self.wait_until_ready()
+        data = load_data()
+        changed = False
+        for guild in self.guilds:
+            if await auto_resolve_config(guild, data):
+                changed = True
+        if changed:
+            save_data(data, reason="auto_resolve_startup", actor=None)
 
 bot = SurvivalBot()
 
@@ -1160,28 +1239,30 @@ class ConfigCog(commands.Cog):
     @app_commands.command(name="setup", description="Initial bot configuration (Dev only)")
     @app_commands.describe(
         timezone="Your server's IANA timezone name, e.g. 'Asia/Seoul' or 'America/New_York'. Used for all timestamps.",
-        announce_channel="The text channel where voting results, eliminations, and announcements will be posted.",
-        dev_role="The Discord role that grants access to all [DEV] commands.",
-        asset_channel="(Optional) A private channel used to host uploaded OC profile pictures. Required for /register with images."
+        announce_channel="The text channel where voting results, eliminations, and announcements will be posted."
     )
     @app_commands.choices(timezone=TIMEZONE_CHOICES)
     @is_dev()
-    async def setup(self, interaction: discord.Interaction, timezone: app_commands.Choice[str], announce_channel: discord.TextChannel, dev_role: discord.Role, asset_channel: discord.TextChannel = None):
+    async def setup(self, interaction: discord.Interaction, timezone: app_commands.Choice[str], announce_channel: discord.TextChannel):
         data = load_data()
+        await auto_resolve_config(interaction.guild, data)
+        
         data["config"]["timezone"] = timezone.value
         data["config"]["announcement_channel_id"] = announce_channel.id
-        data["config"]["dev_role_id"] = dev_role.id
-        if asset_channel:
-            data["config"]["asset_channel"] = asset_channel.id
-        save_data(data)
+        save_data(data, reason="setup_completed", actor=interaction.user)
+        
+        dev_role_str = f"<@&{data['config']['dev_role_id']}>" if data["config"].get("dev_role_id") else "Not configured"
+        asset_channel_str = f"<#{data['config']['asset_channel']}>" if data["config"].get("asset_channel") else "Not configured"
+        data_channel_str = f"<#{data['config']['data_channel_id']}>" if data["config"].get("data_channel_id") else "Not configured"
         
         await interaction.response.send_message(
             embed=get_embed(
                 "✅ Setup Complete",
                 f"**Timezone:** {timezone.name} (`{timezone.value}`)\n"
                 f"**Announce Channel:** {announce_channel.mention}\n"
-                f"**Dev Role:** {dev_role.mention}"
-                + (f"\n**Asset Channel:** {asset_channel.mention}" if asset_channel else ""),
+                f"**Dev Role (Auto):** {dev_role_str}\n"
+                f"**Asset Channel (Auto):** {asset_channel_str}\n"
+                f"**Data Channel (Auto):** {data_channel_str}",
                 "success"
             ),
             ephemeral=True
@@ -1200,8 +1281,10 @@ class ConfigCog(commands.Cog):
     @is_dev()
     async def set_asset_channel(self, interaction: discord.Interaction, channel: discord.TextChannel):
         data = load_data()
+        if await auto_resolve_config(interaction.guild, data):
+            pass
         data["config"]["asset_channel"] = channel.id
-        save_data(data)
+        save_data(data, reason="set asset channel", actor=interaction.user)
         await interaction.response.send_message(embed=get_embed("Success", f"Asset channel updated to {channel.mention}", "success"), ephemeral=True)
 
     @app_commands.command(name="setfeedchannel", description="[DEV] Set the public OC feed channel")
@@ -1227,6 +1310,8 @@ class ConfigCog(commands.Cog):
     @is_dev()
     async def set_data_channel(self, interaction: discord.Interaction, channel: discord.TextChannel):
         data = load_data()
+        if await auto_resolve_config(interaction.guild, data):
+            pass
         data["config"]["data_channel_id"] = channel.id
         save_data(data, reason="set data channel", actor=interaction.user)
         await interaction.response.send_message(embed=get_embed("Success", f"Data channel updated to {channel.mention}", "success"), ephemeral=True)
@@ -1361,6 +1446,9 @@ class RegistrationCog(commands.Cog):
     )
     async def register(self, interaction: discord.Interaction, name: str, birthday_yyyy_mm_dd: str, gender: str, pronouns: str, faceclaim: str, main_skill: str, nationality: str, form_link: str = None, ethnicity: str = "Unknown", profile_picture: discord.Attachment = None):
         data = load_data()
+        if await auto_resolve_config(interaction.guild, data):
+            save_data(data, reason="auto_resolve_register", actor=interaction.user)
+
         user_id = str(interaction.user.id)
         current_ocs = len([oc for oc in data["ocs"].values() if oc["owner_id"] == user_id])
         if current_ocs >= data["config"]["oc_cap"]:
@@ -2890,21 +2978,55 @@ class RankingsCog(commands.Cog):
             view=RankingPaginationView(page_embeds)
         )
 
-    @app_commands.command(name="rankings_partial", description="Dramatically reveal a partial range of rankings (Dev only)")
+    @app_commands.command(name="rankings_partial", description="Reveal specific rankings by number — supports single values and comma/space-separated lists (e.g. '1 5 9' or '3, 7, 12').")
+    @app_commands.describe(ranks="Rank numbers to reveal. Accepts space-separated or comma-separated integers, or a mix. E.g.: '1 3 5' or '2, 8, 14' or '1,2 5 10'.")
     @is_dev()
-    async def partial(self, interaction: discord.Interaction, start_rank: int, end_rank: int):
+    async def partial(self, interaction: discord.Interaction, ranks: str):
         data = load_data()
         color = hex_to_int(data["config"]["reveal_color"])
-        await interaction.response.send_message(embed=get_embed("Evaluation Begins", f"*Revealing ranks {start_rank} to {end_rank}…*", "reveal", show_footer=True))
+        
+        raw_tokens = re.split(r'[\s,]+', ranks.strip())
+        rank_set = set()
+        invalid_tokens = []
+
+        for token in raw_tokens:
+            if not token:
+                continue
+            try:
+                val = int(token)
+                if val < 1:
+                    invalid_tokens.append(token)
+                else:
+                    rank_set.add(val)
+            except ValueError:
+                invalid_tokens.append(token)
+
+        if not rank_set:
+            return await interaction.response.send_message(
+                embed=get_embed("Invalid Input", "No valid rank numbers were found. Provide integers separated by spaces or commas, e.g. `1 3 5` or `2, 8, 14`.", "error"),
+                ephemeral=True
+            )
+
+        sorted_display = sorted(rank_set)
+        ranks_str = ", ".join(f"#{r}" for r in sorted_display)
+        
+        desc = f"*Revealing ranks: {ranks_str}…*"
+        if invalid_tokens:
+            desc += f"\n⚠️ Skipped unrecognized tokens: `{', '.join(invalid_tokens)}`"
+
+        await interaction.response.send_message(embed=get_embed("Evaluation Begins", desc, "reveal", show_footer=True))
         
         channel_id = data["config"].get("announcement_channel_id")
         channel = self.bot.get_channel(int(channel_id)) if channel_id else interaction.channel
         
-        active_ocs = [oc for oc in data["ocs"].values() if not oc.get("eliminated", False) and start_rank <= oc.get("current_rank", 0) <= end_rank]
+        active_ocs = [oc for oc in data["ocs"].values() if not oc.get("eliminated", False) and oc.get("current_rank", 0) in rank_set]
         active_ocs.sort(key=lambda x: x.get("current_rank", 9999), reverse=True)
         
         if not active_ocs:
-            return await channel.send(embed=get_embed("No Results", "No trainees found in that rank range.", "warning"))
+            return await interaction.followup.send(
+                embed=get_embed("No Results", f"No active Trainees were found at the specified rank(s): {ranks_str}.", "warning"),
+                ephemeral=True
+            )
             
         page_size = data["config"].get("reveal_page_size", 7)
         page_embeds = await _run_sequential_reveal(channel, active_ocs, color, page_size, data, show_debut_line=False)
@@ -3078,6 +3200,9 @@ class FeedCog(commands.Cog):
                         media10: discord.Attachment = None):
         
         data = load_data()
+        if await auto_resolve_config(interaction.guild, data):
+            save_data(data, reason="auto_resolve_feed_post", actor=interaction.user)
+            
         oc = next((o for o in data["ocs"].values() if o["name"].lower() == oc_name.lower()), None)
         
         if not oc:
