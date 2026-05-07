@@ -3263,7 +3263,7 @@ class PeerRankingCog(commands.Cog):
             except:
                 username = f"Unknown User (ID: {voter_id})"
                 
-            ranks_str = "\n".join([f"{i+1}. {data['ocs'][oid]['name']}" for i, enumerate(ballot)])
+            ranks_str = "\n".join([f"{i+1}. {data['ocs'][oid]['name']}" for i, oid in enumerate(ballot)])
             embed = discord.Embed(title=f"Ballot · @{username}", description=ranks_str, color=COLORS["neutral"])
             await announce_ch.send(embed=embed)
             await asyncio.sleep(random.uniform(1.0, 2.0))
