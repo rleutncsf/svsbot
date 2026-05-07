@@ -14,6 +14,7 @@ import threading
 import csv
 import random
 import copy
+import aiohttp
 
 # ==========================================
 # 1. CONSTANTS & SYSTEM DEFAULTS
@@ -172,6 +173,7 @@ HELP_SECTIONS = {
             ("/backup", "", "🔒 Export the full data.json to the backup channel. Creates the channel automatically if it doesn't exist."),
             ("/setrevealpage", "size", "🔒 Set how many Trainees appear per reveal page (1–25)."),
             ("/config setdebutslots", "", "🔒 [DEPRECATED] This command has been retired and is now a no-op."),
+            ("/config set", "key value", "🔒 Update a whitelisted config scalar (oc_cap, allow_negative_points, reveal_color, reveal_page_size, peer_ranking_enabled, peer_ranking_transparent, default_multiplier)."),
             ("/purgedata", "", "🔒 ⚠️ Permanently reset ALL data to factory defaults. Requires confirmation. Irreversible."),
         ]
     },
@@ -554,9 +556,12 @@ def format_date_display(date_str: str) -> str:
 
 def calculate_age(dob_str: str) -> int | str:
     """
-    Calculate age in full years using the current date in KST (UTC+9).
-    Input must be stored as YYYY-MM-DD; display format for UI is YYYY/MM/DD.
-    Returns an int on success, or the string "Unknown" on parse failure.
+    Calculate age in full years using the current calendar date in Korean Standard
+    Time (KST, UTC+9, Asia/Seoul). Age increments at midnight KST on the OC's
+    birthday. Input must be stored as YYYY-MM-DD. Returns an int on success, or
+    the string 'Unknown' on parse failure. This function is intentionally decoupled
+    from the server's configured timezone (data["config"]["timezone"]) — KST is
+    always used for age calculation regardless of server settings.
     """
     try:
         dob = datetime.strptime(dob_str, "%Y-%m-%d").date()
@@ -1272,6 +1277,9 @@ class SurvivalBot(commands.Bot):
         # ── STEP 5: Start background scheduler ────────────────────────────────────
         if not voting_scheduler.is_running():
             voting_scheduler.start()
+            
+        if not asset_revalidation_task.is_running():
+            asset_revalidation_task.start()
 
         oc_count = len(hydrated_data.get("ocs", {}))
         post_count = sum(len(v) for v in hydrated_data.get("feeds", {}).values())
@@ -1471,6 +1479,89 @@ class ConfigCog(commands.Cog):
         save_data(data, reason="config_votingcap_updated", actor=interaction.user)
         await interaction.response.send_message(embed=get_embed("Success", f"Voting cap set to {cap}.", "success"), ephemeral=True)
 
+    # Whitelist of config keys that are safe to edit via /config set.
+    # Maps key name → (type_converter, description, valid_range_hint)
+    _CONFIG_SET_WHITELIST = {
+        "oc_cap":                (int,   "Max OCs per user",                         "integer ≥ 1"),
+        "allow_negative_points": (bool,  "Allow OC points to go below 0",            "true / false"),
+        "reveal_color":          (str,   "Hex colour for the ranking reveal embed",   "#RRGGBB"),
+        "reveal_page_size":      (int,   "Trainees shown per reveal page (1–25)",     "integer 1–25"),
+        "peer_ranking_enabled":  (bool,  "Enable / disable the peer ranking system",  "true / false"),
+        "peer_ranking_transparent": (bool, "Post peer ranking results publicly",      "true / false"),
+        "default_multiplier":    (int,   "Default vote multiplier",                   "integer ≥ 1"),
+    }
+
+    @config_group.command(name="set", description="[DEV] Update a specific config key.")
+    @app_commands.describe(
+        key="The config key to change. See /config_view for all keys.",
+        value="The new value as a string. Booleans: 'true'/'false'. Colours: '#RRGGBB'."
+    )
+    @is_dev()
+    async def config_set(self, interaction: discord.Interaction, key: str, value: str):
+        if key not in self._CONFIG_SET_WHITELIST:
+            allowed = "\n".join(
+                f"• `{k}` — {desc} ({hint})"
+                for k, (_, desc, hint) in self._CONFIG_SET_WHITELIST.items()
+            )
+            return await interaction.response.send_message(
+                embed=get_embed(
+                    "Invalid Key",
+                    f"**`{key}`** is not an editable config key.\n\n**Editable keys:**\n{allowed}",
+                    "error"
+                ),
+                ephemeral=True
+            )
+
+        converter, desc, hint = self._CONFIG_SET_WHITELIST[key]
+        converted = None
+        try:
+            if converter is bool:
+                if value.lower() in ("true", "1", "yes"):
+                    converted = True
+                elif value.lower() in ("false", "0", "no"):
+                    converted = False
+                else:
+                    raise ValueError("not a boolean")
+            elif converter is int:
+                converted = int(value)
+            elif converter is str:
+                converted = value
+
+            # Domain validation
+            if key == "oc_cap" and converted < 1:
+                raise ValueError("oc_cap must be ≥ 1")
+            if key == "reveal_page_size" and not (1 <= converted <= 25):
+                raise ValueError("reveal_page_size must be 1–25")
+            if key == "reveal_color":
+                if not (converted.startswith("#") and len(converted) == 7):
+                    raise ValueError("must be #RRGGBB format")
+            if key == "default_multiplier" and converted < 1:
+                raise ValueError("default_multiplier must be ≥ 1")
+
+        except ValueError as e:
+            return await interaction.response.send_message(
+                embed=get_embed(
+                    "Invalid Value",
+                    f"Could not set `{key}` to `{value}`.\n**Expected**: {hint}\n**Error**: {e}",
+                    "error"
+                ),
+                ephemeral=True
+            )
+
+        data = load_data()
+        old_value = data["config"].get(key)
+        data["config"][key] = converted
+        save_data(data, reason=f"config_set: {key} = {converted}", actor=interaction.user)
+
+        await interaction.response.send_message(
+            embed=get_embed(
+                "Config Updated",
+                f"**`{key}`** ({desc})\n`{old_value}` → `{converted}`",
+                "success"
+            ),
+            ephemeral=True
+        )
+
     @app_commands.command(name="purgedata", description="[DEV] ⚠️ Permanently wipe ALL bot data and reset to defaults")
     @is_dev()
     async def purgedata(self, interaction: discord.Interaction):
@@ -1542,7 +1633,8 @@ class RegistrationCog(commands.Cog):
                     content=f"[OC Asset] `{name}` — owner: <@{interaction.user.id}>",
                     file=file
                 )
-                profile_picture_url = asset_msg.attachments[0].url
+                att = asset_msg.attachments[0]
+                profile_picture_url = att.proxy_url or att.url
 
         oc_id = str(uuid.uuid4())
         new_oc = {
@@ -1653,7 +1745,8 @@ class RegistrationCog(commands.Cog):
                     content=f"[OC Asset] `{name or oc['name']}` — owner: <@{interaction.user.id}>",
                     file=file
                 )
-                oc["profile_picture_url"] = asset_msg.attachments[0].url
+                att = asset_msg.attachments[0]
+                oc["profile_picture_url"] = att.proxy_url or att.url
 
         if name is not None: oc["name"] = name
         if birthday_yyyy_mm_dd is not None: oc["birthday"] = birthday_yyyy_mm_dd
@@ -1722,7 +1815,7 @@ class RegistrationCog(commands.Cog):
                 dorm_str = f"{oc['dorm_floor']} · {oc['dorm_room']}" if oc.get('dorm_floor') else "Unassigned"
                 
                 desc = (
-                    f"**Birthday / Age**: {format_date_display(oc['birthday'])} · {age} yrs (KST)\n"
+                    f"**Birthday / Age**: {format_date_display(oc['birthday'])} · {age} yrs (KST / GMT+9)\n"
                     f"**Gender / Pronouns**: {oc['gender']} · {oc['pronouns']}\n"
                     f"**Faceclaim**: {oc['faceclaim']}\n"
                     f"**Skill**: {oc['main_skill']}\n"
@@ -1853,7 +1946,8 @@ class RegistrationCog(commands.Cog):
             embed.color = COLORS["error"]
 
         age = calculate_age(oc["birthday"])
-        embed.add_field(name="Birthday / Age", value=f"{format_date_display(oc['birthday'])} · {age} yrs (KST)", inline=True)
+        kst_label = "KST (GMT+9)"
+        embed.add_field(name="Birthday / Age", value=f"{format_date_display(oc['birthday'])} · {age} yrs ({kst_label})", inline=True)
         embed.add_field(name="Gender / Pronouns", value=f"{oc['gender']} · {oc['pronouns']}", inline=True)
         embed.add_field(name="Faceclaim", value=oc["faceclaim"], inline=True)
         embed.add_field(name="Main Skill", value=oc["main_skill"], inline=True)
@@ -1951,6 +2045,16 @@ class VotingCog(commands.Cog):
 
             if oc["id"] not in data["voting"]["votes"]:
                 data["voting"]["votes"][oc["id"]] = []
+
+            # --- Duplicate vote guard (per-OC, per-round) ---
+            existing_voters = data["voting"]["votes"].get(oc["id"], [])
+            if user_id in existing_voters:
+                rejected.append((
+                    token,
+                    f"You've already voted for **{oc['name']}** this round — each OC can only receive one vote per user per round. Your vote was not counted again."
+                ))
+                continue
+
             data["voting"]["votes"][oc["id"]].append(user_id)
 
             daily_counts[user_id] = daily_counts.get(user_id, 0) + 1
@@ -2328,7 +2432,7 @@ class GradesCog(commands.Cog):
             embed=get_embed(
                 "Grade Assigned",
                 f"**{oc['name']}** is now Grade **{grade_label}**.\n"
-                f"Owner {discord.utils.mention_user(int(oc['owner_id']))} has been given the "
+                f"Owner <@{oc['owner_id']}> has been given the "
                 f"**[{grade_label}]** role with colour `{data['grades'][grade_label]['color']}`.",
                 "success"
             )
@@ -3535,6 +3639,77 @@ class FeedCog(commands.Cog):
 # ==========================================
 # 6. BACKGROUND TASKS
 # ==========================================
+@tasks.loop(hours=6)
+async def asset_revalidation_task():
+    """
+    Every 6 hours, iterate all active and archived OCs that have a stored
+    profile_picture_url. Issue a HEAD request to each URL. If the response
+    status is not 200 (expired, 404, 403), attempt to re-fetch the image
+    from the asset channel by scanning for a message whose content contains
+    the OC's ID or name, then re-post the attachment to re-anchor a fresh URL.
+    
+    Because re-fetching from the channel is not always possible (message may
+    have been pruned), this task logs a warning per OC and clears the dead URL
+    so the embed degrades gracefully (no broken image icon) rather than silently.
+    """
+    data = load_data()
+    asset_ch_id = data["config"].get("asset_channel")
+    if not asset_ch_id:
+        return
+
+    asset_ch = bot.get_channel(int(asset_ch_id))
+    changed = False
+
+    async with aiohttp.ClientSession() as session:
+        all_ocs = list(data["ocs"].values()) + list(data["archived_ocs"].values())
+        for oc in all_ocs:
+            url = oc.get("profile_picture_url")
+            if not url:
+                continue
+            try:
+                async with session.head(url, timeout=aiohttp.ClientTimeout(total=8)) as resp:
+                    if resp.status == 200:
+                        continue  # URL still alive
+            except Exception:
+                pass  # Treat connection errors as expired
+
+            # URL is dead. Attempt re-upload by scanning asset channel history.
+            new_url = None
+            if asset_ch:
+                try:
+                    async for msg in asset_ch.history(limit=500, oldest_first=False):
+                        if oc["id"] in msg.content or oc["name"].lower() in msg.content.lower():
+                            if msg.attachments:
+                                att = msg.attachments[0]
+                                # Re-post to generate a fresh, anchored URL
+                                img_bytes = await att.read()
+                                new_file = discord.File(
+                                    fp=io.BytesIO(img_bytes),
+                                    filename=att.filename
+                                )
+                                new_msg = await asset_ch.send(
+                                    content=f"[OC Asset — Re-anchored] `{oc['name']}` (id:{oc['id']})",
+                                    file=new_file
+                                )
+                                new_att = new_msg.attachments[0]
+                                new_url = new_att.proxy_url or new_att.url
+                                break
+                except Exception as e:
+                    print(f"asset_revalidation_task: error re-fetching asset for {oc['name']}: {e}")
+
+            # Update or clear the stored URL
+            target_store = data["ocs"] if oc["id"] in data["ocs"] else data["archived_ocs"]
+            if new_url:
+                target_store[oc["id"]]["profile_picture_url"] = new_url
+                print(f"asset_revalidation_task: re-anchored URL for {oc['name']}")
+            else:
+                target_store[oc["id"]]["profile_picture_url"] = None
+                print(f"asset_revalidation_task: cleared dead URL for {oc['name']} (no re-upload source found)")
+            changed = True
+
+    if changed:
+        save_data(data, reason="asset_revalidation_auto")
+
 @tasks.loop(minutes=1)
 async def voting_scheduler():
     data = load_data()
