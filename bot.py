@@ -70,6 +70,7 @@ HELP_SECTIONS = {
             ("/register", "name birthday_yyyy_mm_dd gender pronouns faceclaim main_skill nationality [form_link] [ethnicity] [profile_picture]", "Register a new Trainee OC. Each user may have up to the configured OC cap."),
             ("/profile", "oc_name", "View a Trainee's full profile card."),
             ("/oc_all", "", "Browse all currently active Trainees (paginated)."),
+            ("/oc_search", "query", "search for a trainee by partial name. shows a paginated profile view if multiple matches are found."),
             ("/oc_eliminated", "", "View all eliminated Trainees."),
             ("/removeoc", "oc_name", "Permanently archive one of your own Trainees. Requires confirmation."),
             ("/editoc", "oc_name [name] [birthday_yyyy_mm_dd] [gender] [pronouns] [faceclaim] [main_skill] [nationality] [ethnicity] [form_link] [profile_picture]", "Edit any field on one of your own Trainees."),
@@ -908,7 +909,7 @@ def get_rank_change(oc_id, current_rank, data):
     last_snap = data["rank_snapshots"][-1]["rankings"]
     last_rank = next((r["rank"] for r in last_snap if r["oc_id"] == oc_id), None)
     if last_rank is None:
-        return "🆕"
+        return "new"
     diff = last_rank - current_rank
     if diff > 0: return f"▲ {diff}"
     elif diff < 0: return f"▼ {abs(diff)}"
@@ -932,13 +933,13 @@ class RankingPaginationView(discord.ui.View):
         self.prev_btn.disabled = self.current == 0
         self.next_btn.disabled = self.current == len(self.pages) - 1
 
-    @discord.ui.button(label="◀ Prev", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label="◀", style=discord.ButtonStyle.secondary)
     async def prev_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.current -= 1
         self._update_buttons()
         await interaction.response.edit_message(embed=self.pages[self.current], view=self)
 
-    @discord.ui.button(label="Next ▶", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label="▶", style=discord.ButtonStyle.secondary)
     async def next_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.current += 1
         self._update_buttons()
@@ -951,6 +952,51 @@ class RankingPaginationView(discord.ui.View):
             try:
                 await self.message.edit(view=self)
             except:
+                pass
+
+class OcAllPaginationView(discord.ui.View):
+    def __init__(self, ocs: list, data: dict, cog):
+        super().__init__(timeout=300)
+        self.ocs = ocs          # list of oc dicts, pre-sorted alphabetically by name
+        self.data = data        # full data dict snapshot at time of command invocation
+        self.cog = cog          # reference to the OCCog instance (to call _build_profile_embed)
+        self.current = 0
+        self.message = None
+        self._update_buttons()
+
+    def _update_buttons(self):
+        self.prev_btn.disabled = self.current == 0
+        self.next_btn.disabled = self.current == len(self.ocs) - 1
+
+    def _build_page_embed(self) -> discord.Embed:
+        oc = self.ocs[self.current]
+        embed = self.cog._build_profile_embed(oc, self.data)
+        # append page indicator to the embed footer
+        total = len(self.ocs)
+        existing_footer = embed.footer.text or ""
+        page_note = f"trainee {self.current + 1} of {total}"
+        embed.set_footer(text=f"{page_note}  ·  {existing_footer}" if existing_footer else page_note)
+        return embed
+
+    @discord.ui.button(label="◀", style=discord.ButtonStyle.secondary)
+    async def prev_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.current -= 1
+        self._update_buttons()
+        await interaction.response.edit_message(embed=self._build_page_embed(), view=self)
+
+    @discord.ui.button(label="▶", style=discord.ButtonStyle.secondary)
+    async def next_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.current += 1
+        self._update_buttons()
+        await interaction.response.edit_message(embed=self._build_page_embed(), view=self)
+
+    async def on_timeout(self):
+        for item in self.children:
+            item.disabled = True
+        if self.message:
+            try:
+                await self.message.edit(view=self)
+            except Exception:
                 pass
 
 class ConfirmResetView(discord.ui.View):
@@ -969,7 +1015,7 @@ class ConfirmResetView(discord.ui.View):
             except discord.NotFound:
                 pass
 
-    @discord.ui.button(label="✅ Confirm", style=discord.ButtonStyle.danger)
+    @discord.ui.button(label="confirm", style=discord.ButtonStyle.danger)
     async def confirm_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self._disable_all()
         data = load_data()
@@ -1041,11 +1087,11 @@ class ConfirmResetView(discord.ui.View):
             view=self
         )
 
-    @discord.ui.button(label="✖ Cancel", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label="cancel", style=discord.ButtonStyle.secondary)
     async def cancel_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self._disable_all()
         await interaction.response.edit_message(
-            embed=get_embed("Cancelled", "No worries — the reset was cancelled. Everything stays the same. ✌️", "system"),
+            embed=get_embed("cancelled", "the reset was cancelled. everything stays the same.", "system"),
             view=self
         )
 
@@ -1068,7 +1114,7 @@ class ConfirmPurgeView(discord.ui.View):
             except discord.NotFound:
                 pass
 
-    @discord.ui.button(label="⚠️ YES, WIPE EVERYTHING", style=discord.ButtonStyle.danger)
+    @discord.ui.button(label="yes, wipe everything", style=discord.ButtonStyle.danger)
     async def confirm_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self._disable_all()
         # Perform atomic reset: overwrite data.json with DEFAULT_SCHEMA
@@ -1084,11 +1130,11 @@ class ConfirmPurgeView(discord.ui.View):
             view=self
         )
 
-    @discord.ui.button(label="✖ Cancel", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label="cancel", style=discord.ButtonStyle.secondary)
     async def cancel_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self._disable_all()
         await interaction.response.edit_message(
-            embed=get_embed("Cancelled", "Phew! The wipe was cancelled. Nothing was changed. ✌️", "system"),
+            embed=get_embed("cancelled", "the wipe was cancelled. nothing was changed.", "system"),
             view=self
         )
 
@@ -1115,7 +1161,7 @@ class ConfirmDeleteOCView(discord.ui.View):
             except discord.NotFound:
                 pass
 
-    @discord.ui.button(label="🗑️ Yes, Delete Permanently", style=discord.ButtonStyle.danger)
+    @discord.ui.button(label="yes, delete permanently", style=discord.ButtonStyle.danger)
     async def confirm_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self._disable_all()
         data = load_data()
@@ -1223,11 +1269,11 @@ class ConfirmDeleteOCView(discord.ui.View):
             view=self
         )
 
-    @discord.ui.button(label="✖ Cancel", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label="cancel", style=discord.ButtonStyle.secondary)
     async def cancel_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self._disable_all()
         await interaction.response.edit_message(
-            embed=get_embed("Cancelled", "Hard-delete aborted. The OC was not modified.", "system"), 
+            embed=get_embed("cancelled", "hard-delete aborted. the oc was not modified.", "system"), 
             view=self
         )
     
@@ -1251,7 +1297,7 @@ class ConfirmRemoveOCView(discord.ui.View):
             except discord.NotFound:
                 pass
 
-    @discord.ui.button(label="🗑️ Yes, Archive", style=discord.ButtonStyle.danger)
+    @discord.ui.button(label="yes, archive", style=discord.ButtonStyle.danger)
     async def confirm_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self._disable_all()
         data = load_data()
@@ -1284,15 +1330,15 @@ class ConfirmRemoveOCView(discord.ui.View):
         save_data(data, reason=f"OC archived: {self.oc_name}", actor=self.actor)
         
         await interaction.response.edit_message(
-            embed=get_embed("OC Archived", f"**{self.oc_name}** has been archived and removed from the active roster. Take care! 👋", "success"),
+            embed=get_embed("oc archived", f"**{self.oc_name}** has been archived and removed from the active roster. take care.", "success"),
             view=self
         )
 
-    @discord.ui.button(label="✖ Cancel", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label="cancel", style=discord.ButtonStyle.secondary)
     async def cancel_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self._disable_all()
         await interaction.response.edit_message(
-            embed=get_embed("Cancelled", "Archive cancelled. The OC was not modified.", "system"), 
+            embed=get_embed("cancelled", "archive cancelled. the oc was not modified.", "system"), 
             view=self
         )
 
@@ -1323,7 +1369,7 @@ class FeedPostView(discord.ui.View):
                     return post
         return None
 
-    @discord.ui.button(label="❤️ Like", style=discord.ButtonStyle.danger, custom_id="feed_like:placeholder")
+    @discord.ui.button(label="like", style=discord.ButtonStyle.danger, custom_id="feed_like:placeholder")
     async def like_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         post = self._get_post()
         if not post:
@@ -1354,7 +1400,7 @@ class FeedPostView(discord.ui.View):
         except Exception:
             await interaction.response.defer()
 
-    @discord.ui.button(label="💬 Comment", style=discord.ButtonStyle.secondary, custom_id="feed_comment:placeholder")
+    @discord.ui.button(label="comment", style=discord.ButtonStyle.secondary, custom_id="feed_comment:placeholder")
     async def comment_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         post = self._get_post()
         if not post:
@@ -1439,7 +1485,7 @@ class CommentModal(discord.ui.Modal, title="Leave a Comment"):
                 ephemeral=True
             )
 
-        await interaction.response.send_message(embed=get_embed("Comment Posted", "💬 Your comment is posted! Head to the thread to continue the conversation.", "success"), ephemeral=True)
+        await interaction.response.send_message(embed=get_embed("comment posted", "your comment is posted! head to the thread to continue the conversation.", "success"), ephemeral=True)
 
 async def _run_sequential_reveal(channel: discord.TextChannel, ocs_ordered: list, reveal_color: int, page_size: int, data: dict, show_debut_line: bool = True, hide_points: bool = False):
     pages = []
@@ -1605,10 +1651,10 @@ bot = SurvivalBot()
 @bot.tree.error
 async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
     if isinstance(error, app_commands.CheckFailure):
-        embed = get_embed("Access Denied", "🔒 This command is for staff only! If you think you should have access, reach out to a Dev.", "error")
+        embed = get_embed("Access Denied", "this command is for staff only. if you think you should have access, reach out to a dev.", "error")
         await interaction.response.send_message(embed=embed, ephemeral=True)
     else:
-        embed = get_embed("System Error", f"Oops! Something went wrong on our end. Here's the error detail in case you need it: {str(error)}", "error")
+        embed = get_embed("System Error", f"oops! something went wrong on our end. here's the error detail in case you need it: {str(error)}", "error")
         if interaction.response.is_done():
             await interaction.followup.send(embed=embed, ephemeral=True)
         else:
@@ -1979,15 +2025,15 @@ class RegistrationCog(commands.Cog):
         user_id = str(interaction.user.id)
         current_ocs = len([oc for oc in data["ocs"].values() if oc["owner_id"] == user_id])
         if current_ocs >= data["config"]["oc_cap"]:
-            return await interaction.response.send_message(embed=get_embed("Limit Reached", f"⛔ Looks like you've already got {data['config']['oc_cap']} Trainees — that's the maximum allowed right now! Feel free to reach out to a staff member if you have questions.", "error"), ephemeral=True)
+            return await interaction.response.send_message(embed=get_embed("limit reached", f"looks like you've already got {data['config']['oc_cap']} trainees — that's the maximum allowed right now! feel free to reach out to a staff member if you have questions.", "error"), ephemeral=True)
         
         for oc in data["ocs"].values():
             if oc["owner_id"] == user_id and oc["name"].lower() == name.lower():
-                return await interaction.response.send_message(embed=get_embed("Duplicate Name", f"⛔ You've already got a Trainee named **{name}**! Each of your OCs needs a unique name — try a different one.", "error"), ephemeral=True)
+                return await interaction.response.send_message(embed=get_embed("duplicate name", f"you've already got a trainee named **{name}**! each of your ocs needs a unique name — try a different one.", "error"), ephemeral=True)
 
         if profile_picture:
             if not profile_picture.content_type or not profile_picture.content_type.startswith("image/"):
-                return await interaction.response.send_message(embed=get_embed("Invalid File", "Hmm, that file type isn't supported. Please attach an image (PNG, JPG, GIF, WEBP)!", "error"), ephemeral=True)
+                return await interaction.response.send_message(embed=get_embed("invalid file", "hmm, that file type isn't supported. please attach an image (png, jpg, gif, webp).", "error"), ephemeral=True)
 
         await interaction.response.defer()
 
@@ -2026,7 +2072,7 @@ class RegistrationCog(commands.Cog):
         save_data(data, reason="oc_registered", actor=interaction.user)
         
         embed = self._build_profile_embed(new_oc, data)
-        await interaction.followup.send(content="🎉 Welcome to the show! Your Trainee has been registered. Here's their profile:", embed=embed)
+        await interaction.followup.send(content="welcome to the show! your trainee has been registered. here's their profile:", embed=embed)
 
     @app_commands.command(name="profile", description="View a Trainee's profile")
     @app_commands.describe(oc_name="The exact name of the Trainee OC to look up.")
@@ -2034,7 +2080,7 @@ class RegistrationCog(commands.Cog):
         data = load_data()
         oc = find_oc(oc_name, data)
         if not oc:
-            return await interaction.response.send_message(embed=get_embed("Not Found", f"We looked everywhere but couldn't find a Trainee named '{oc_name}'.", "error"), ephemeral=True)
+            return await interaction.response.send_message(embed=get_embed("not found", f"we looked everywhere but couldn't find a trainee named '{oc_name}'.", "error"), ephemeral=True)
         await interaction.response.send_message(embed=self._build_profile_embed(oc, data))
 
     @app_commands.command(name="removeoc", description="Permanently archive one of your own Trainees. Requires confirmation.")
@@ -2043,12 +2089,12 @@ class RegistrationCog(commands.Cog):
         data = load_data()
         oc = find_oc(oc_name, data)
         if not oc or oc["owner_id"] != str(interaction.user.id):
-            return await interaction.response.send_message(embed=get_embed("Error", "Hmm, we couldn't find that Trainee in your roster. Double-check the name and try again!", "error"), ephemeral=True)
+            return await interaction.response.send_message(embed=get_embed("error", "hmm, we couldn't find that trainee in your roster. double-check the name and try again!", "error"), ephemeral=True)
         
         view = ConfirmRemoveOCView(oc["id"], oc["name"], interaction.user)
         embed = get_embed(
-            "⚠️ Confirm Archive",
-            f"You are about to permanently archive **{oc['name']}**. They will be removed from the active roster, dorms, and rankings.\n\nThis **cannot be undone**. Click Confirm to proceed.",
+            "confirm archive",
+            f"you are about to permanently archive **{oc['name']}**. they will be removed from the active roster, dorms, and rankings.\n\nthis **cannot be undone**. click confirm to proceed.",
             "warning"
         )
         await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
@@ -2072,24 +2118,24 @@ class RegistrationCog(commands.Cog):
         data = load_data()
         oc = find_oc(oc_name, data)
         if not oc:
-            return await interaction.response.send_message(embed=get_embed("Not Found", "Hmm, we couldn't find that Trainee in your roster. Double-check the name and try again!", "error"), ephemeral=True)
+            return await interaction.response.send_message(embed=get_embed("not found", "hmm, we couldn't find that trainee in your roster. double-check the name and try again!", "error"), ephemeral=True)
         if oc["owner_id"] != str(interaction.user.id):
-            return await interaction.response.send_message(embed=get_embed("Permission Denied", "🔒 You can only edit your own Trainees!", "error"), ephemeral=True)
+            return await interaction.response.send_message(embed=get_embed("permission denied", "you can only edit your own trainees.", "error"), ephemeral=True)
         
         if birthday_yyyy_mm_dd is not None:
             try:
                 datetime.strptime(birthday_yyyy_mm_dd, "%Y-%m-%d")
             except ValueError:
-                return await interaction.response.send_message(embed=get_embed("Invalid Date", "Birthday must be in YYYY-MM-DD format (e.g., 2003-07-14).", "error"), ephemeral=True)
+                return await interaction.response.send_message(embed=get_embed("invalid date", "birthday must be in yyyy-mm-dd format (e.g., 2003-07-14).", "error"), ephemeral=True)
                 
         if name is not None and name.lower() != oc["name"].lower():
             for other_oc in data["ocs"].values():
                 if other_oc["owner_id"] == str(interaction.user.id) and other_oc["id"] != oc["id"] and other_oc["name"].lower() == name.lower():
-                    return await interaction.response.send_message(embed=get_embed("Duplicate Name", f"⛔ You've already got a Trainee named **{name}**! Each of your OCs needs a unique name.", "error"), ephemeral=True)
+                    return await interaction.response.send_message(embed=get_embed("duplicate name", f"you've already got a trainee named **{name}**! each of your ocs needs a unique name.", "error"), ephemeral=True)
 
         if profile_picture is not None:
             if not profile_picture.content_type or not profile_picture.content_type.startswith("image/"):
-                return await interaction.response.send_message(embed=get_embed("Invalid File", "Hmm, that file type isn't supported. Please attach an image (PNG, JPG, GIF, WEBP)!", "error"), ephemeral=True)
+                return await interaction.response.send_message(embed=get_embed("invalid file", "hmm, that file type isn't supported. please attach an image (png, jpg, gif, webp).", "error"), ephemeral=True)
         
         await interaction.response.defer()
         
@@ -2110,7 +2156,7 @@ class RegistrationCog(commands.Cog):
         
         save_data(data, reason="oc_edited", actor=interaction.user)
         embed = self._build_profile_embed(oc, data)
-        await interaction.followup.send(content="✅ Trainee profile updated!", embed=embed)
+        await interaction.followup.send(content="trainee profile updated!", embed=embed)
 
     @app_commands.command(name="deleteoc", description="[DEV] Permanently and irreversibly delete an OC from all data")
     @app_commands.describe(oc_name="The name of the OC to permanently purge. Searches active and archived OCs.")
@@ -2150,50 +2196,71 @@ class RegistrationCog(commands.Cog):
         data = load_data()
         active_ocs = [oc for oc in data["ocs"].values() if not oc.get("eliminated", False)]
         if not active_ocs:
-            return await interaction.response.send_message(embed=get_embed("Empty", "The stage is empty! No Trainees have been registered yet.", "warning"))
-            
+            return await interaction.response.send_message(
+                embed=get_embed("no trainees yet", "the stage is empty — no trainees have been registered yet.", "warning")
+            )
+
         active_ocs.sort(key=lambda x: x["name"].lower())
-        page_size = data["config"].get("reveal_page_size", 7)
-        batches = [active_ocs[i:i + page_size] for i in range(0, len(active_ocs), page_size)]
-        
-        pages = []
-        for idx, batch in enumerate(batches):
-            embed = discord.Embed(title=f"All Trainees (Page {idx+1}/{len(batches)})", color=COLORS["neutral"])
-            for i, oc in enumerate(batch):
-                age = calculate_age(oc["birthday"])
-                grade_str = f" [{oc['grade']}]" if oc.get('grade') else ""
-                dorm_str = f"{oc['dorm_floor']} · {oc['dorm_room']}" if oc.get('dorm_floor') else "Unassigned"
-                
-                desc = (
-                    f"**Birthday / Age**: {format_date_display(oc['birthday'])} · {age} yrs (KST / GMT+9)\n"
-                    f"**Gender / Pronouns**: {oc['gender']} · {oc['pronouns']}\n"
-                    f"**Faceclaim**: {oc['faceclaim']}\n"
-                    f"**Skill**: {oc['main_skill']}\n"
-                    f"**Origin**: {oc['nationality']} · {oc['ethnicity']}\n"
-                    f"**Grade**: {oc.get('grade', 'Ungraded')}\n"
-                    f"**Dorm**: {dorm_str}\n"
-                )
-                if oc.get('form_link'):
-                    desc += f"[Profile Link]({oc['form_link']})"
-                    
-                embed.add_field(name=f"{oc['name']}{grade_str}", value=desc, inline=False)
-                
-                if i == 0 and oc.get("profile_picture_url"):
-                    embed.set_thumbnail(url=oc["profile_picture_url"])
-                    
-            pages.append(embed)
-            
-        if len(pages) > 1:
-            await interaction.response.send_message(embed=pages[0], view=RankingPaginationView(pages))
+
+        view = OcAllPaginationView(active_ocs, data, self)
+        first_embed = view._build_page_embed()
+
+        if len(active_ocs) == 1:
+            # single trainee — no navigation needed
+            await interaction.response.send_message(embed=first_embed)
         else:
-            await interaction.response.send_message(embed=pages[0])
+            await interaction.response.send_message(embed=first_embed, view=view)
+            view.message = await interaction.original_response()
+
+    @app_commands.command(name="oc_search", description="search for a trainee by name")
+    @app_commands.describe(query="part of the trainee's name to search for — partial matches work fine")
+    async def oc_search(self, interaction: discord.Interaction, query: str):
+        data = load_data()
+        query_lower = query.strip().lower()
+
+        if not query_lower:
+            return await interaction.response.send_message(
+                embed=get_embed("empty search", "please type part of a name to search for.", "warning"),
+                ephemeral=True
+            )
+
+        active_ocs = [oc for oc in data["ocs"].values() if not oc.get("eliminated", False)]
+        matches = [oc for oc in active_ocs if query_lower in oc["name"].lower()]
+
+        if not matches:
+            return await interaction.response.send_message(
+                embed=get_embed(
+                    "no results",
+                    f"couldn't find any active trainees matching **{query}**. double-check the spelling and try again.",
+                    "error"
+                ),
+                ephemeral=True
+            )
+
+        matches.sort(key=lambda x: x["name"].lower())
+
+        if len(matches) == 1:
+            embed = self._build_profile_embed(matches[0], data)
+            return await interaction.response.send_message(embed=embed)
+
+        # multiple matches — use paginated per-oc view
+        view = OcAllPaginationView(matches, data, self)
+        first_embed = view._build_page_embed()
+        # prepend search context note to footer
+        total = len(matches)
+        existing_footer = first_embed.footer.text or ""
+        search_note = f"showing {total} results for \"{query}\""
+        first_embed.set_footer(text=f"{search_note}  ·  {existing_footer}" if existing_footer else search_note)
+
+        await interaction.response.send_message(embed=first_embed, view=view)
+        view.message = await interaction.original_response()
 
     @app_commands.command(name="oc_eliminated", description="View all eliminated Trainees")
     async def oc_eliminated(self, interaction: discord.Interaction):
         data = load_data()
         eliminated_ocs = [oc for oc in data["ocs"].values() if oc.get("eliminated", False)]
         if not eliminated_ocs:
-            return await interaction.response.send_message(embed=get_embed("None", "Nobody's been eliminated yet — everyone's still in the running! 🌟", "system"))
+            return await interaction.response.send_message(embed=get_embed("none", "nobody's been eliminated yet — everyone's still in the running.", "system"))
             
         eliminated_ocs.sort(key=lambda x: x["name"].lower())
         page_size = 25 
@@ -2201,9 +2268,9 @@ class RegistrationCog(commands.Cog):
         
         pages = []
         for idx, batch in enumerate(batches):
-            embed = discord.Embed(title="Eliminated Trainees", color=COLORS["system"])
+            embed = discord.Embed(title="eliminated trainees", color=COLORS["system"])
             for oc in batch:
-                embed.add_field(name=f"~~{oc['name']}~~", value=f"Faceclaim: {oc['faceclaim']}\nOwner: <@{oc['owner_id']}>", inline=False)
+                embed.add_field(name=f"~~{oc['name']}~~", value=f"faceclaim: {oc['faceclaim']}\nowner: <@{oc['owner_id']}>", inline=False)
             pages.append(embed)
             
         if len(pages) > 1:
@@ -2276,12 +2343,12 @@ class RegistrationCog(commands.Cog):
         save_data(data, reason="ocs_eliminated", actor=interaction.user)
         
         if mode.value == "name":
-            embed_announce = get_embed("A Trainee Has Been Eliminated", f"*{names[0]} has been eliminated from the competition.*", "warning")
+            embed_announce = get_embed("a trainee has been eliminated", f"*{names[0]} has been eliminated from the competition.*", "warning")
             if channel: await channel.send(embed=embed_announce)
             await interaction.response.send_message(embed=get_embed("Success", f"Done. {names[0]} has been eliminated.", "success"), ephemeral=True)
         else:
             bullet_list = "\n".join([f"• {name}" for name in names])
-            embed_announce = get_embed("Elimination Results", f"The following Trainees have been eliminated:\n{bullet_list}", "warning")
+            embed_announce = get_embed("elimination results", f"the following trainees have been eliminated:\n{bullet_list}", "warning")
             if channel: await channel.send(embed=embed_announce)
             await interaction.response.send_message(embed=get_embed("Success", f"Eliminated {len(names)} Trainee(s): {', '.join(names)}", "success"), ephemeral=True)
 
@@ -2289,7 +2356,7 @@ class RegistrationCog(commands.Cog):
         grade = oc.get("grade")
         grade_data = data["grades"].get(grade, {"color": "#B0B0B0"}) if grade else {"color": "#B0B0B0"}
         
-        embed = discord.Embed(title=f"{oc['name']} {'⭐' if not grade else f'[{grade}]'}", color=hex_to_int(grade_data["color"]))
+        embed = discord.Embed(title=f"{oc['name']}{f' [{grade}]' if grade else ''}", color=hex_to_int(grade_data["color"]))
         
         if oc.get("eliminated", False):
             embed.title = f"~~{oc['name']}~~ ✗ [ELIMINATED]"
@@ -2297,18 +2364,18 @@ class RegistrationCog(commands.Cog):
 
         age = calculate_age(oc["birthday"])
         kst_label = "KST (GMT+9)"
-        embed.add_field(name="Birthday / Age", value=f"{format_date_display(oc['birthday'])} · {age} yrs ({kst_label})", inline=True)
-        embed.add_field(name="Gender / Pronouns", value=f"{oc['gender']} · {oc['pronouns']}", inline=True)
-        embed.add_field(name="Faceclaim", value=oc["faceclaim"], inline=True)
-        embed.add_field(name="Main Skill", value=oc["main_skill"], inline=True)
-        embed.add_field(name="Nationality / Ethnicity", value=f"{oc['nationality']} · {oc['ethnicity']}", inline=True)
+        embed.add_field(name="birthday / age", value=f"{format_date_display(oc['birthday'])} · {age} yrs ({kst_label})", inline=True)
+        embed.add_field(name="gender / pronouns", value=f"{oc['gender']} · {oc['pronouns']}", inline=True)
+        embed.add_field(name="faceclaim", value=oc["faceclaim"], inline=True)
+        embed.add_field(name="main skill", value=oc["main_skill"], inline=True)
+        embed.add_field(name="nationality / ethnicity", value=f"{oc['nationality']} · {oc['ethnicity']}", inline=True)
         if oc.get("form_link"):
-            embed.add_field(name="Profile", value=f"[View Full Form]({oc['form_link']})", inline=True)
+            embed.add_field(name="profile", value=f"[view full form]({oc['form_link']})", inline=True)
         
-        rank_str = "Eliminated" if oc.get("eliminated", False) else f"Rank #{oc.get('current_rank', 0)}"
-        embed.add_field(name="Points / Rank", value=f"{oc['total_points']:,} pts · {rank_str}", inline=True)
-        embed.add_field(name="Grade", value=grade if grade else "Ungraded", inline=True)
-        embed.add_field(name="Dorm", value=f"{oc['dorm_floor']} · {oc['dorm_room']}" if oc.get('dorm_floor') else "Unassigned", inline=True)
+        rank_str = "eliminated" if oc.get("eliminated", False) else f"rank #{oc.get('current_rank', 0)}"
+        embed.add_field(name="points / rank", value=f"{oc['total_points']:,} pts · {rank_str}", inline=True)
+        embed.add_field(name="grade", value=grade if grade else "ungraded", inline=True)
+        embed.add_field(name="dorm", value=f"{oc['dorm_floor']} · {oc['dorm_room']}" if oc.get('dorm_floor') else "unassigned", inline=True)
         
         if data["config"].get("peer_ranking_enabled"):
             last_resolved = next(
@@ -2317,9 +2384,9 @@ class RegistrationCog(commands.Cog):
             )
             if last_resolved:
                 if last_resolved.get("benefit_applied_to") == oc["id"]:
-                    embed.add_field(name="Legacy Multiplier", value="Received peer top ranking last session.", inline=False)
+                    embed.add_field(name="legacy multiplier", value="received peer top ranking last session.", inline=False)
                 elif last_resolved.get("penalty_applied_to") == oc["id"]:
-                    embed.add_field(name="Popularity Tax", value="Received peer bottom ranking last session.", inline=False)
+                    embed.add_field(name="popularity tax", value="received peer bottom ranking last session.", inline=False)
 
         if oc.get("profile_picture_url"):
             embed.set_thumbnail(url=oc["profile_picture_url"])
@@ -2368,8 +2435,8 @@ class VotingCog(commands.Cog):
         if not data["voting"]["is_open"]:
             return await interaction.response.send_message(
                 embed=get_embed(
-                    "Voting Closed",
-                    "Voting isn't open right now! Stay tuned for the next voting round. 🗳️",
+                    "voting is closed",
+                    "voting isn't open right now. stay tuned for the next voting round.",
                     "error"
                 ),
                 ephemeral=True
@@ -2389,9 +2456,8 @@ class VotingCog(commands.Cog):
         if remaining is not None and remaining <= 0:
             return await interaction.response.send_message(
                 embed=get_embed(
-                    "Daily Cap Reached",
-                    f"You've used all **{cap}** of your votes for today! "
-                    f"Your votes reset at **12:00 AM KST**. Come back then! 🗓️",
+                    "daily cap reached",
+                    f"you've used all **{cap}** of your votes for today. they reset at **12:00 am kst** — come back then!",
                     "error"
                 ),
                 ephemeral=True
@@ -2401,7 +2467,7 @@ class VotingCog(commands.Cog):
 
         if not raw_names:
             return await interaction.response.send_message(
-                embed=get_embed("No Input", "Please provide at least one Trainee name to vote for!", "error"),
+                embed=get_embed("no input", "please provide at least one trainee name to vote for.", "error"),
                 ephemeral=True
             )
 
@@ -2410,12 +2476,12 @@ class VotingCog(commands.Cog):
 
         for token in raw_names:
             if remaining is not None and remaining <= 0:
-                rejected.append((token, f"Vote cap of **{cap}** reached mid-batch"))
+                rejected.append((token, f"vote cap of **{cap}** reached mid-batch"))
                 continue
 
             oc = find_oc(token, data)
             if not oc:
-                rejected.append((token, "Hmm, we couldn't find a Trainee with that name. Check the spelling and try again!"))
+                rejected.append((token, "hmm, we couldn't find a trainee with that name. check the spelling and try again."))
                 continue
 
             if oc.get("eliminated", False):
@@ -2432,7 +2498,7 @@ class VotingCog(commands.Cog):
             if not allow_multi_vote and user_id in existing_voters:
                 rejected.append((
                     token,
-                    f"You've already voted for **{oc['name']}** this round — each OC can only receive one vote per user per round. Your vote was not counted again."
+                    f"you've already voted for **{oc['name']}** this round — each oc can only receive one vote per user per round. your vote was not counted again."
                 ))
                 continue
 
@@ -2448,26 +2514,26 @@ class VotingCog(commands.Cog):
 
         votes_today_final = daily_counts.get(user_id, 0)
         quota_line = (
-            f"**Today's Quota**: {votes_today_final}/{cap} vote(s) used today (resets 12:00 AM KST)."
+            f"**today's quota**: {votes_today_final}/{cap} vote(s) used today (resets 12:00 am kst)."
             if cap > 0 else
-            f"**Votes cast today** (no cap): {votes_today_final}"
+            f"**votes cast today** (no cap): {votes_today_final}"
         )
 
         if accepted and not rejected:
             color = "success"
-            title = "✅ Vote(s) Recorded"
+            title = "vote(s) recorded"
         elif accepted and rejected:
             color = "warning"
-            title = "⚠️ Partial Vote(s) Recorded"
+            title = "partial vote(s) recorded"
         else:
             color = "error"
-            title = "❌ No Votes Recorded"
+            title = "no votes recorded"
 
         desc_parts = []
         if accepted:
-            desc_parts.append("**Accepted**:\n" + "\n".join(f"• {n}" for n in accepted))
+            desc_parts.append("**accepted**:\n" + "\n".join(f"• {n}" for n in accepted))
         if rejected:
-            desc_parts.append("**Rejected**:\n" + "\n".join(f"• `{n}` — {reason}" for n, reason in rejected))
+            desc_parts.append("**rejected**:\n" + "\n".join(f"• `{n}` — {reason}" for n, reason in rejected))
         desc_parts.append(quota_line)
 
         await interaction.response.send_message(
@@ -2602,24 +2668,24 @@ class VotingCog(commands.Cog):
         
         status_parts = []
         if is_open:
-            status_parts.append("✅ **Voting is currently OPEN.**")
+            status_parts.append("**voting is currently open.**")
         else:
-            status_parts.append("❌ **Voting is currently CLOSED.**")
+            status_parts.append("**voting is currently closed.**")
             
         sched_open = data["voting"].get("scheduled_open_time")
         sched_close = data["voting"].get("scheduled_close_time")
 
         if sched_open:
             dt = datetime.fromisoformat(sched_open)
-            status_parts.append(f"📅 **Scheduled to Open:** {dt.strftime('%Y/%m/%d %H:%M KST')}")
+            status_parts.append(f"**scheduled to open:** {dt.strftime('%Y/%m/%d %H:%M kst')}")
         if sched_close:
             dt = datetime.fromisoformat(sched_close)
-            status_parts.append(f"📅 **Scheduled to Close:** {dt.strftime('%Y/%m/%d %H:%M KST')}")
+            status_parts.append(f"**scheduled to close:** {dt.strftime('%Y/%m/%d %H:%M kst')}")
 
         if is_open:
             multi_vote_on = data["config"].get("allow_multi_vote", False)
             if multi_vote_on:
-                status_parts.append("♾️ **Multi-Vote Mode:** Enabled — you may vote for the same Trainee more than once this round.")
+                status_parts.append("**multi-vote mode:** enabled — you may vote for the same trainee more than once this round.")
             
         if is_open and cap > 0:
             user_id = str(interaction.user.id)
@@ -2627,11 +2693,11 @@ class VotingCog(commands.Cog):
             votes_today = data["voting"]["daily_vote_counts"].get(user_id, 0)
             remaining = cap - votes_today
             status_parts.append(
-                f"\n🗳️ **Your Daily Votes:** {votes_today}/{cap} used "
-                f"(~{remaining} remaining · resets 12:00 AM KST)"
+                f"\n**your daily votes:** {votes_today}/{cap} used "
+                f"(~{remaining} remaining · resets 12:00 am kst)"
             )
             
-        await interaction.response.send_message(embed=get_embed("Voting Status", "\n".join(status_parts), "neutral"), ephemeral=True)
+        await interaction.response.send_message(embed=get_embed("voting status", "\n".join(status_parts), "neutral"), ephemeral=True)
 
 class PointsCog(commands.Cog):
     def __init__(self, bot):
@@ -4117,8 +4183,8 @@ async def voting_scheduler():
                 ch = bot.get_channel(int(ann_id))
                 if ch:
                     await ch.send(embed=get_embed(
-                        "🗳️ Voting Is Now Open!",
-                        "The scheduled voting round has begun. Cast your votes!",
+                        "voting is now open",
+                        "the scheduled voting round has begun. cast your votes!",
                         "success",
                         show_footer=True
                     ))
@@ -4168,7 +4234,7 @@ async def voting_scheduler():
                 if ch:
                     await ch.send(embed=get_embed(
                         "Voting Closed",
-                        "✅ The scheduled voting round has closed. Results have been tallied and rankings updated.",
+                        "the scheduled voting round has closed. results have been tallied and rankings updated.",
                         "system",
                         show_footer=True
                     ))
