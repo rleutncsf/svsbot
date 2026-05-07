@@ -86,6 +86,7 @@ HELP_SECTIONS = {
             ("/votingclose", "", "🔒 Close voting immediately or schedule it. Applies the multiplier, tallies votes, and updates rankings."),
             ("/config votingmultiplier", "value", "🔒 Set the vote-to-points multiplier."),
             ("/config votingcap", "cap", "🔒 Set max votes per user **per day** (resets 12:00 AM KST). 0 = unlimited."),
+            ("/config_multivote", "enabled", "🔒 Toggle whether a single user can vote for the same OC multiple times per round (True/False)."),
         ]
     },
     "points": {
@@ -164,16 +165,17 @@ HELP_SECTIONS = {
         "title": "⚙️ Configuration",
         "commands": [],
         "dev_commands": [
-            ("/setup", "timezone announce_channel [force]", "🔒 Initial bot setup. Dev role, asset channel, and data channel are resolved automatically."),
+            ("/setup", "timezone announce_channel [force]", "🔒 Initial bot setup. Dev role, #assets, #data, and #rankings channels are detected automatically if present."),
             ("/config_view", "", "🔒 View all current configuration values."),
             ("/setassetchannel", "channel", "🔒 Set the persistent asset storage channel."),
             ("/setfeedchannel", "channel", "🔒 Set the public feed channel."),
             ("/setbackupchannel", "channel", "🔒 Set the designated channel for JSON backups."),
             ("/setdatachannel", "channel", "🔒 Set the channel that receives automatic data-change notifications."),
+            ("/setrankingschannel", "channel", "🔒 Set the channel that receives the live leaderboard after every voting close."),
             ("/backup", "", "🔒 Export the full data.json to the backup channel. Creates the channel automatically if it doesn't exist."),
             ("/setrevealpage", "size", "🔒 Set how many Trainees appear per reveal page (1–25)."),
             ("/config setdebutslots", "", "🔒 [DEPRECATED] This command has been retired and is now a no-op."),
-            ("/config set", "key value", "🔒 Update a whitelisted config scalar (oc_cap, allow_negative_points, reveal_color, reveal_page_size, peer_ranking_enabled, peer_ranking_transparent, default_multiplier)."),
+            ("/config set", "key value", "🔒 Update a whitelisted config scalar."),
             ("/purgedata", "", "🔒 ⚠️ Permanently reset ALL data to factory defaults. Requires confirmation. Irreversible."),
         ]
     },
@@ -187,11 +189,13 @@ DEFAULT_SCHEMA = {
         "default_multiplier": 1,
         "oc_cap": 5,
         "allow_negative_points": False,
+        "allow_multi_vote": False,
         "reveal_color": "#FFD700",
         "asset_channel": None,
         "feed_channel": None,
         "backup_channel_id": None,
         "data_channel_id": None,
+        "rankings_channel_id": None,
         "data_anchor_message_id": None,
         "setup_completed_at": None,
         "deployment_count": 0,
@@ -256,6 +260,16 @@ def migrate_schema(data: dict) -> bool:
 
     if "deployment_count" not in data["config"]:
         data["config"]["deployment_count"] = 0
+        modified = True
+
+    # v1.x → allow_multi_vote (toggleable duplicate-vote policy)
+    if "allow_multi_vote" not in data["config"]:
+        data["config"]["allow_multi_vote"] = False
+        modified = True
+
+    # v1.x → rankings_channel_id (auto-detected #rankings channel)
+    if "rankings_channel_id" not in data["config"]:
+        data["config"]["rankings_channel_id"] = None
         modified = True
 
     if "last_closed_at" not in data["voting"]:
@@ -604,6 +618,62 @@ async def upload_to_asset_channel(bot_instance: discord.Client, oc_name: str, oc
         print(f"upload_to_asset_channel: failed for {oc_name}: {e}")
         return None
 
+async def _post_rankings_to_channel(bot_instance: discord.Client, data: dict) -> None:
+    """
+    Build the live leaderboard embed pages and post them sequentially to the
+    configured rankings_channel_id. Silently no-ops if the channel is not set,
+    not found, or if there are no active OCs.
+
+    This function intentionally does NOT paginate interactively — it posts all
+    embed pages as individual messages so the channel retains a permanent,
+    scrollable record of every round's final standings.
+    """
+    rankings_channel_id = data["config"].get("rankings_channel_id")
+    if not rankings_channel_id:
+        return
+
+    channel = bot_instance.get_channel(int(rankings_channel_id))
+    if not channel:
+        try:
+            channel = await bot_instance.fetch_channel(int(rankings_channel_id))
+        except Exception:
+            return
+
+    active_ocs = sorted(
+        [oc for oc in data["ocs"].values() if not oc.get("eliminated", False)],
+        key=lambda x: x.get("current_rank", 9999)
+    )
+    if not active_ocs:
+        return
+
+    page_size = data["config"].get("reveal_page_size", 7)
+    pages_data = [active_ocs[i:i + page_size] for i in range(0, len(active_ocs), page_size)]
+    total_pages = len(pages_data)
+
+    # Header message
+    header_embed = get_embed(
+        "🏆 Updated Rankings",
+        f"Rankings updated after voting closed · {now().strftime('%Y/%m/%d %H:%M %Z')} · {len(active_ocs)} active trainee(s)",
+        "neutral",
+        show_footer=True
+    )
+    await channel.send(embed=header_embed)
+
+    for page_idx, page_ocs in enumerate(pages_data, start=1):
+        lines = []
+        for oc in page_ocs:
+            rank_change = get_rank_change(oc["id"], oc.get("current_rank", 0), data)
+            lines.append(
+                f"**#{oc.get('current_rank', '?')}** {oc['name']} "
+                f"— `{oc['total_points']:,} pts` {rank_change}"
+            )
+        page_embed = get_embed(
+            f"Rankings — Page {page_idx}/{total_pages}",
+            "\n".join(lines),
+            "neutral"
+        )
+        await channel.send(embed=page_embed)
+
 async def auto_resolve_config(guild: discord.Guild | None, data: dict) -> bool:
     if not guild:
         return False
@@ -623,6 +693,14 @@ async def auto_resolve_config(guild: discord.Guild | None, data: dict) -> bool:
             channel = next((c for c in guild.text_channels if c.name.lower() == "data"), None)
         if channel:
             data["config"]["data_channel_id"] = channel.id
+            changed = True
+
+    if data["config"].get("rankings_channel_id") is None:
+        channel = discord.utils.get(guild.text_channels, name="rankings")
+        if not channel:
+            channel = next((c for c in guild.text_channels if c.name.lower() == "rankings"), None)
+        if channel:
+            data["config"]["rankings_channel_id"] = channel.id
             changed = True
 
     if data["config"].get("dev_role_id") is None:
@@ -1428,6 +1506,17 @@ class SurvivalBot(commands.Bot):
         if changed:
             save_data(hydrated_data, reason="auto_resolve_startup", actor=None)
 
+        # Step 5b: Log channel auto-detection results
+        resolved_asset    = hydrated_data["config"].get("asset_channel")
+        resolved_data     = hydrated_data["config"].get("data_channel_id")
+        resolved_rankings = hydrated_data["config"].get("rankings_channel_id")
+        print(
+            f"Channel auto-detection: "
+            f"assets={'#' + str(resolved_asset) if resolved_asset else 'NOT FOUND'} | "
+            f"data={'#' + str(resolved_data) if resolved_data else 'NOT FOUND'} | "
+            f"rankings={'#' + str(resolved_rankings) if resolved_rankings else 'NOT FOUND'}"
+        )
+
         # ── STEP 6: Start background scheduler ────────────────────────────────────
         if not voting_scheduler.is_running():
             voting_scheduler.start()
@@ -1506,10 +1595,15 @@ class ConfigCog(commands.Cog):
         data["config"]["announcement_channel_id"] = announce_channel.id
         data["config"]["setup_completed_at"] = now().isoformat()
         save_data(data, reason="setup_completed", actor=interaction.user)
-        
-        dev_role_str = f"<@&{data['config']['dev_role_id']}>" if data["config"].get("dev_role_id") else "Not configured"
-        asset_channel_str = f"<#{data['config']['asset_channel']}>" if data["config"].get("asset_channel") else "Not configured"
-        data_channel_str = f"<#{data['config']['data_channel_id']}>" if data["config"].get("data_channel_id") else "Not configured"
+
+        # --- Build per-channel resolution strings for the confirmation embed ---
+        def _ch_str(ch_id) -> str:
+            return f"<#{ch_id}>" if ch_id else "⚠️ Not detected — set manually with the appropriate `/set*` command"
+
+        asset_str    = _ch_str(data["config"].get("asset_channel"))
+        data_str     = _ch_str(data["config"].get("data_channel_id"))
+        rankings_str = _ch_str(data["config"].get("rankings_channel_id"))
+        dev_role_str = f"<@&{data['config']['dev_role_id']}>" if data["config"].get("dev_role_id") else "⚠️ Not detected — no Administrator role found"
         
         await interaction.response.send_message(
             embed=get_embed(
@@ -1517,8 +1611,9 @@ class ConfigCog(commands.Cog):
                 f"**Timezone:** {timezone.name} (`{timezone.value}`)\n"
                 f"**Announce Channel:** {announce_channel.mention}\n"
                 f"**Dev Role (Auto):** {dev_role_str}\n"
-                f"**Asset Channel (Auto):** {asset_channel_str}\n"
-                f"**Data Channel (Auto):** {data_channel_str}",
+                f"**Asset Channel (Auto):** {asset_str}\n"
+                f"**Data Channel (Auto):** {data_str}\n"
+                f"**Rankings Channel (Auto):** {rankings_str}",
                 "success"
             ),
             ephemeral=True
@@ -1571,6 +1666,24 @@ class ConfigCog(commands.Cog):
         data["config"]["data_channel_id"] = channel.id
         save_data(data, reason="set data channel", actor=interaction.user)
         await interaction.response.send_message(embed=get_embed("Success", f"Data channel updated to {channel.mention}", "success"), ephemeral=True)
+
+    @app_commands.command(name="setrankingschannel", description="[DEV] Set the channel where the live rankings leaderboard is automatically posted.")
+    @app_commands.describe(channel="The text channel to designate for live rankings posts.")
+    @is_dev()
+    async def set_rankings_channel(self, interaction: discord.Interaction, channel: discord.TextChannel):
+        data = load_data()
+        if await auto_resolve_config(interaction.guild, data):
+            pass  # keep auto-resolve side-effects
+        data["config"]["rankings_channel_id"] = channel.id
+        save_data(data, reason="set rankings channel", actor=interaction.user)
+        await interaction.response.send_message(
+            embed=get_embed(
+                "Success",
+                f"Rankings channel updated to {channel.mention}. The live leaderboard will be posted there automatically after every voting round closes.",
+                "success"
+            ),
+            ephemeral=True
+        )
 
     @app_commands.command(name="backup", description="[DEV] Export the full data.json to the backup channel")
     @is_dev()
@@ -1667,6 +1780,7 @@ class ConfigCog(commands.Cog):
     _CONFIG_SET_WHITELIST = {
         "oc_cap":                (int,   "Max OCs per user",                         "integer ≥ 1"),
         "allow_negative_points": (bool,  "Allow OC points to go below 0",            "true / false"),
+        "allow_multi_vote":      (bool,  "Allow multiple votes on one OC per round",  "true / false"),
         "reveal_color":          (str,   "Hex colour for the ranking reveal embed",   "#RRGGBB"),
         "reveal_page_size":      (int,   "Trainees shown per reveal page (1–25)",     "integer 1–25"),
         "peer_ranking_enabled":  (bool,  "Enable / disable the peer ranking system",  "true / false"),
@@ -2143,6 +2257,35 @@ class VotingCog(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
 
+    @app_commands.command(
+        name="config_multivote",
+        description="[DEV] Toggle whether a single user may vote for the same OC multiple times per round."
+    )
+    @app_commands.describe(
+        enabled="True = allow repeat votes on one OC per round. False = enforce one vote per OC per user per round (default)."
+    )
+    @is_dev()
+    async def config_multivote(self, interaction: discord.Interaction, enabled: bool):
+        data = load_data()
+        data["config"]["allow_multi_vote"] = enabled
+        save_data(data, reason=f"allow_multi_vote set to {enabled}", actor=interaction.user)
+
+        state_str  = "✅ **Enabled**"  if enabled else "❌ **Disabled**"
+        policy_str = (
+            "Users may now vote for the same Trainee more than once within the same voting round. "
+            "Each repeated vote still counts toward (and is deducted from) the voter's daily vote cap."
+            if enabled else
+            "Standard policy restored — each user may vote for a given Trainee only once per round."
+        )
+        await interaction.response.send_message(
+            embed=get_embed(
+                "Multi-Vote Policy Updated",
+                f"**Multi-Vote:** {state_str}\n\n{policy_str}",
+                "success" if enabled else "warning"
+            ),
+            ephemeral=True
+        )
+
     @app_commands.command(name="vote", description="Cast vote(s) for one or more Trainees (comma-separated names)")
     @app_commands.describe(oc_names="One or more Trainee names separated by commas. Example: Mira, Juno, Haeun")
     async def vote(self, interaction: discord.Interaction, oc_names: str):
@@ -2210,8 +2353,10 @@ class VotingCog(commands.Cog):
                 data["voting"]["votes"][oc["id"]] = []
 
             # --- Duplicate vote guard (per-OC, per-round) ---
-            existing_voters = data["voting"]["votes"].get(oc["id"], [])
-            if user_id in existing_voters:
+            # Bypassed when allow_multi_vote is True (dev toggle).
+            allow_multi_vote = data["config"].get("allow_multi_vote", False)
+            existing_voters  = data["voting"]["votes"].get(oc["id"], [])
+            if not allow_multi_vote and user_id in existing_voters:
                 rejected.append((
                     token,
                     f"You've already voted for **{oc['name']}** this round — each OC can only receive one vote per user per round. Your vote was not counted again."
@@ -2359,6 +2504,7 @@ class VotingCog(commands.Cog):
                     await channel.send(embed=embed)
             
             await interaction.followup.send(embed=get_embed("Success", "✅ Voting has closed! Results have been tallied and rankings are updated.", "success"))
+            await _post_rankings_to_channel(self.bot, data)
         else:
             try:
                 target_dt = datetime(year, month, day, hour, minute, tzinfo=KST)
@@ -2396,6 +2542,11 @@ class VotingCog(commands.Cog):
         if sched_close:
             dt = datetime.fromisoformat(sched_close)
             status_parts.append(f"📅 **Scheduled to Close:** {dt.strftime('%Y/%m/%d %H:%M KST')}")
+
+        if is_open:
+            multi_vote_on = data["config"].get("allow_multi_vote", False)
+            if multi_vote_on:
+                status_parts.append("♾️ **Multi-Vote Mode:** Enabled — you may vote for the same Trainee more than once this round.")
             
         if is_open and cap > 0:
             user_id = str(interaction.user.id)
@@ -3948,6 +4099,7 @@ async def voting_scheduler():
                         "system",
                         show_footer=True
                     ))
+            await _post_rankings_to_channel(bot, data)
 
     if changed:
         save_data(data, reason="scheduler_auto_action")
