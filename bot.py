@@ -22,6 +22,9 @@ import aiohttp
 DATA_FILE = "data.json"
 TEMP_FILE = "data.tmp"
 
+DB_LOADED  = False
+DATA_DIRTY = False
+
 _data_channel_lock = asyncio.Lock()
 
 POINTLOG_ACTION_RESETALL = "resetall"
@@ -441,15 +444,60 @@ async def load_data_from_channel(bot_instance: discord.Client) -> dict:
     return data
 
 def save_data(data: dict, reason: str = "routine update", actor: discord.User | discord.Member | None = None):
+    global DATA_DIRTY
     with open(TEMP_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=4)
     os.replace(TEMP_FILE, DATA_FILE)
+    DATA_DIRTY = True
     
     try:
         loop = asyncio.get_running_loop()
         loop.create_task(notify_data_channel(data, reason, actor))
     except RuntimeError:
         pass  # No running event loop (e.g. called during synchronous startup)
+
+async def push_backup_to_discord(data: dict, reason: str = "mutation") -> None:
+    global DATA_DIRTY
+    if not DB_LOADED:
+        return
+
+    try:
+        payload_bytes = json.dumps(data, indent=4, ensure_ascii=False).encode("utf-8")
+        if len(payload_bytes) > 8_000_000:
+            print("push_backup_to_discord: payload exceeds 8 MB limit, skipping upload.")
+            return
+
+        for guild in bot.guilds:
+            ch = discord.utils.get(guild.text_channels, name="bot-db-backup")
+            if ch:
+                timestamp_str = datetime.now(KST).strftime('%Y%m%d_%H%M%S')
+                file = discord.File(
+                    io.BytesIO(payload_bytes),
+                    filename=f"data_{timestamp_str}.json"
+                )
+                new_msg = await ch.send(
+                    f"[BACKUP] {reason} — {datetime.now(KST).strftime('%Y-%m-%d %H:%M:%S KST')}",
+                    file=file
+                )
+                DATA_DIRTY = False
+
+                try:
+                    await ch.purge(
+                        limit=50,
+                        check=lambda m: m.author == bot.user and m.id != new_msg.id
+                    )
+                except (discord.Forbidden, discord.HTTPException):
+                    pass
+
+                return
+    except Exception as e:
+        print(f"[push_backup_to_discord] failed: {type(e).__name__}: {e}")
+
+async def save_and_backup(data: dict, reason: str = "mutation") -> None:
+    global DATA_DIRTY
+    DATA_DIRTY = True
+    save_data(data, reason=reason)
+    await push_backup_to_discord(data, reason=reason)
 
 async def notify_data_channel(data: dict, reason: str, actor: discord.User | discord.Member | None = None) -> discord.Message | None:
     async with _data_channel_lock:
@@ -1440,65 +1488,68 @@ class SurvivalBot(commands.Bot):
         print("Commands synced. Deferring data hydration until bot is fully ready.")
 
     async def on_ready(self):
+        global DB_LOADED
         print(f"Logged in as {self.user} (ID: {self.user.id}). Running startup sequence...")
 
-        # ── STEP 1: Bootstrap the channels from environment before hydration ──
-        # This solves the bootstrap deadlock: if data.json is blank (fresh deploy),
-        # we seed the channel IDs from the environment variables before attempting to
-        # fetch anything from Discord.
-        asset_channel_env = os.getenv("ASSET_CHANNEL_ID", "").strip()
-        data_channel_env = os.getenv("DATA_CHANNEL_ID", "").strip()
-
-        local_data = load_data()
-        dirty = False
-
-        if data_channel_env and not local_data["config"].get("data_channel_id"):
-            local_data["config"]["data_channel_id"] = data_channel_env
-            dirty = True
-
-        if asset_channel_env and not local_data["config"].get("asset_channel"):
-            local_data["config"]["asset_channel"] = asset_channel_env
-            dirty = True
-
-        if dirty:
-            with open(TEMP_FILE, "w", encoding="utf-8") as f:
-                json.dump(local_data, f, indent=4)
-            os.replace(TEMP_FILE, DATA_FILE)
-            print(f"Bootstrapped channels from env: data={data_channel_env}, asset={asset_channel_env}")
-
-        # ── STEP 2: Hydrate from Discord channel (cache is now warm) ──────────────
-        hydrated_data = await load_data_from_channel(self)
-        
-        # Increment deployment count and synchronously write
-        hydrated_data["config"]["deployment_count"] = hydrated_data["config"].get("deployment_count", 0) + 1
-        with open(TEMP_FILE, "w", encoding="utf-8") as f:
-            json.dump(hydrated_data, f, indent=4)
-        os.replace(TEMP_FILE, DATA_FILE)
-        print(f"Deployment #{hydrated_data['config']['deployment_count']} ready.")
-
-        # ── STEP 3: Alert if Hydration Failed ──
-        oc_count = len(hydrated_data.get("ocs", {}))
-        if oc_count == 0 and hydrated_data["config"].get("deployment_count", 0) > 1:
+        if not DB_LOADED:
             for guild in self.guilds:
-                data_ch_id = hydrated_data["config"].get("data_channel_id")
-                if data_ch_id:
-                    ch = self.get_channel(int(data_ch_id))
-                    if ch:
-                        await ch.send(embed=get_embed(
-                            "⚠️ Hydration Warning",
-                            "Bot restarted but **no OC data was loaded**. This may indicate a hydration failure.\n"
-                            "Check that the pinned data snapshot in this channel is valid and accessible.\n"
-                            "If data was lost, use `/backup` to restore from the backup channel.",
-                            "error",
-                            show_footer=True
-                        ))
+                ch = discord.utils.get(guild.text_channels, name="bot-db-backup")
+                if not ch:
+                    try:
+                        cat = discord.utils.get(guild.categories, name="Special")
+                        overwrites = {
+                            guild.default_role: discord.PermissionOverwrite(view_channel=False),
+                            guild.me: discord.PermissionOverwrite(
+                                view_channel=True, send_messages=True,
+                                attach_files=True, read_message_history=True,
+                                manage_messages=True
+                            )
+                        }
+                        ch = await guild.create_text_channel(
+                            "bot-db-backup",
+                            category=cat,
+                            overwrites=overwrites,
+                            topic="automated db backup storage.",
+                            slowmode_delay=21600
+                        )
+                        print(f"on_ready: auto-created #bot-db-backup in '{guild.name}'.")
+                    except Exception as e:
+                        print(f"on_ready: could not create #bot-db-backup in '{guild.name}': {type(e).__name__}: {e}")
 
-        # ── STEP 4: Register persistent views for all known feed posts ─────────────
+                if ch:
+                    try:
+                        async for message in ch.history(limit=20):
+                            if message.author == self.user and message.attachments:
+                                att = message.attachments[0]
+                                if att.filename.endswith(".json"):
+                                    try:
+                                        file_bytes = await att.read()
+                                        parsed = json.loads(file_bytes)
+                                        if not isinstance(parsed, dict):
+                                            print("on_ready: backup failed structural validation, skipping restore.")
+                                            break
+                                        migrate_schema(parsed)
+                                        with open(TEMP_FILE, "w", encoding="utf-8") as f:
+                                            json.dump(parsed, f, indent=4)
+                                        os.replace(TEMP_FILE, DATA_FILE)
+                                        oc_count = len(parsed.get("ocs", {}))
+                                        print(f"on_ready: hydration successful — {oc_count} OC(s) restored from #bot-db-backup.")
+                                        break
+                                    except (json.JSONDecodeError, ValueError) as e:
+                                        print(f"on_ready: backup attachment is corrupt, skipping restore: {e}")
+                                        break
+                    except Exception as e:
+                        print(f"on_ready: error reading #bot-db-backup history: {type(e).__name__}: {e}")
+
+            DB_LOADED = True
+
+        # Register persistent views for all known feed posts
+        hydrated_data = load_data()
         for feed_list in hydrated_data.get("feeds", {}).values():
             for post in feed_list:
                 self.add_view(FeedPostView(post["post_id"]))
 
-        # ── STEP 5: Auto-resolve config (guild roles/channels) ───────────────────
+        # Auto-resolve config (guild roles/channels)
         changed = False
         for guild in self.guilds:
             if await auto_resolve_config(guild, hydrated_data):
@@ -1506,24 +1557,15 @@ class SurvivalBot(commands.Bot):
         if changed:
             save_data(hydrated_data, reason="auto_resolve_startup", actor=None)
 
-        # Step 5b: Log channel auto-detection results
-        resolved_asset    = hydrated_data["config"].get("asset_channel")
-        resolved_data     = hydrated_data["config"].get("data_channel_id")
-        resolved_rankings = hydrated_data["config"].get("rankings_channel_id")
-        print(
-            f"Channel auto-detection: "
-            f"assets={'#' + str(resolved_asset) if resolved_asset else 'NOT FOUND'} | "
-            f"data={'#' + str(resolved_data) if resolved_data else 'NOT FOUND'} | "
-            f"rankings={'#' + str(resolved_rankings) if resolved_rankings else 'NOT FOUND'}"
-        )
-
-        # ── STEP 6: Start background scheduler ────────────────────────────────────
+        # Start background tasks
         if not voting_scheduler.is_running():
             voting_scheduler.start()
-            
         if not asset_revalidation_task.is_running():
             asset_revalidation_task.start()
+        if not auto_backup_db.is_running():
+            auto_backup_db.start()
 
+        oc_count = len(hydrated_data.get("ocs", {}))
         post_count = sum(len(v) for v in hydrated_data.get("feeds", {}).values())
         print(f"Startup complete. Loaded {oc_count} OC(s), {post_count} feed post(s).")
 
@@ -4103,6 +4145,19 @@ async def voting_scheduler():
 
     if changed:
         save_data(data, reason="scheduler_auto_action")
+
+@tasks.loop(minutes=5)
+async def auto_backup_db():
+    global DATA_DIRTY
+    if not DATA_DIRTY or not DB_LOADED:
+        return
+    if not os.path.exists(DATA_FILE):
+        return
+    try:
+        data = load_data()
+        await push_backup_to_discord(data, reason="auto-watchdog")
+    except Exception as e:
+        print(f"[auto_backup_db] Watchdog backup failed: {type(e).__name__}: {e}")
 
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
