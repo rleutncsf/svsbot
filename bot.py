@@ -164,7 +164,7 @@ HELP_SECTIONS = {
         "title": "⚙️ Configuration",
         "commands": [],
         "dev_commands": [
-            ("/setup", "timezone announce_channel", "🔒 Initial bot setup. Dev role, asset channel, and data channel are resolved automatically."),
+            ("/setup", "timezone announce_channel [force]", "🔒 Initial bot setup. Dev role, asset channel, and data channel are resolved automatically."),
             ("/config_view", "", "🔒 View all current configuration values."),
             ("/setassetchannel", "channel", "🔒 Set the persistent asset storage channel."),
             ("/setfeedchannel", "channel", "🔒 Set the public feed channel."),
@@ -192,6 +192,9 @@ DEFAULT_SCHEMA = {
         "feed_channel": None,
         "backup_channel_id": None,
         "data_channel_id": None,
+        "data_anchor_message_id": None,
+        "setup_completed_at": None,
+        "deployment_count": 0,
         "reveal_page_size": 7,
         "debut_slots": 0,
         "debut_slots_public": True,
@@ -245,6 +248,15 @@ def migrate_schema(data: dict) -> bool:
         if key not in data["config"]:
             data["config"][key] = val
             modified = True
+
+    for key in ("data_anchor_message_id", "setup_completed_at"):
+        if key not in data["config"]:
+            data["config"][key] = None
+            modified = True
+
+    if "deployment_count" not in data["config"]:
+        data["config"]["deployment_count"] = 0
+        modified = True
 
     if "last_closed_at" not in data["voting"]:
         data["voting"]["last_closed_at"] = None
@@ -340,11 +352,9 @@ def load_data():
 async def load_data_from_channel(bot_instance: discord.Client) -> dict:
     """
     Rehydrate data.json from the most recent JSON attachment posted to the
-    designated data channel. Uses fetch_channel (HTTP, cache-bypassing) to
-    guarantee the channel object is always resolved, even after a cold restart.
-    Scans up to 200 messages and returns the first valid JSON attachment found.
-    Falls back to local data.json if no attachment is found or the channel is
-    unreachable.
+    designated data channel.
+    PRIMARY: Finds the pinned anchor message and loads it instantly.
+    FALLBACK: Scans up to 200 messages as legacy behavior.
     """
     data = load_data()
     channel_id = data["config"].get("data_channel_id")
@@ -362,6 +372,30 @@ async def load_data_from_channel(bot_instance: discord.Client) -> dict:
         print(f"load_data_from_channel: could not resolve channel {channel_id}: {e}")
         return data
 
+    # PRIMARY: Try pinned anchor first
+    try:
+        pins = await channel.pins()
+        for pinned_msg in sorted(pins, key=lambda m: m.created_at, reverse=True):
+            for attachment in pinned_msg.attachments:
+                if attachment.filename.startswith("data_") and attachment.filename.endswith(".json"):
+                    try:
+                        json_bytes = await attachment.read()
+                        fetched_data = json.loads(json_bytes)
+                        migrate_schema(fetched_data)
+                        with open(TEMP_FILE, "w", encoding="utf-8") as f:
+                            json.dump(fetched_data, f, indent=4)
+                        os.replace(TEMP_FILE, DATA_FILE)
+                        oc_count = len(fetched_data.get("ocs", {}))
+                        print(f"Rehydration successful (from pinned anchor): loaded '{attachment.filename}' from #{channel.name} "
+                              f"(message {pinned_msg.id}). {oc_count} OC(s) restored.")
+                        return fetched_data
+                    except (json.JSONDecodeError, discord.HTTPException) as parse_err:
+                        print(f"load_data_from_channel: skipping malformed pin attachment '{attachment.filename}': {parse_err}")
+                        continue
+    except Exception as e:
+        print(f"load_data_from_channel: pin scan failed: {e}")
+
+    # FALLBACK: Linear 200-msg scan
     try:
         async for message in channel.history(limit=200, oldest_first=False):
             for attachment in message.attachments:
@@ -382,11 +416,11 @@ async def load_data_from_channel(bot_instance: discord.Client) -> dict:
                 os.replace(TEMP_FILE, DATA_FILE)
 
                 oc_count = len(fetched_data.get("ocs", {}))
-                print(f"Rehydration successful: loaded '{attachment.filename}' from #{channel.name} "
+                print(f"Rehydration successful (fallback scan): loaded '{attachment.filename}' from #{channel.name} "
                       f"(message {message.id}). {oc_count} OC(s) restored.")
                 return fetched_data
 
-        print("load_data_from_channel: no valid JSON attachment found in the last 200 messages. Using local data.")
+        print("load_data_from_channel: no valid JSON attachment found in recent history. Using local data.")
     except Exception as e:
         print(f"load_data_from_channel: unexpected error during channel scan: {e}")
 
@@ -403,15 +437,29 @@ def save_data(data: dict, reason: str = "routine update", actor: discord.User | 
     except RuntimeError:
         pass  # No running event loop (e.g. called during synchronous startup)
 
-async def notify_data_channel(data: dict, reason: str, actor: discord.User | discord.Member | None = None):
+async def notify_data_channel(data: dict, reason: str, actor: discord.User | discord.Member | None = None) -> discord.Message | None:
     async with _data_channel_lock:
         channel_id = data["config"].get("data_channel_id")
+        
+        # Live auto-resolution for data channel
         if not channel_id:
-            return
+            for guild in bot.guilds:
+                ch = discord.utils.get(guild.text_channels, name="data")
+                if ch:
+                    data["config"]["data_channel_id"] = ch.id
+                    channel_id = ch.id
+                    # Update local state so it's persisted, but avoid calling save_data to prevent recursion
+                    with open(TEMP_FILE, "w", encoding="utf-8") as f:
+                        json.dump(data, f, indent=4)
+                    os.replace(TEMP_FILE, DATA_FILE)
+                    break
+            if not channel_id:
+                return None
+                
         try:
             channel = bot.get_channel(int(channel_id))
             if not channel:
-                return
+                return None
                 
             embed = discord.Embed(title="📋 Data Updated", color=COLORS["neutral"])
             embed.add_field(name="Reason", value=reason, inline=True)
@@ -424,9 +472,32 @@ async def notify_data_channel(data: dict, reason: str, actor: discord.User | dis
             filename = f"data_{timestamp_str}.json"
             data_file = discord.File(fp=io.BytesIO(json_bytes), filename=filename)
             
-            await channel.send(embed=embed, file=data_file)
-        except Exception:
-            pass
+            new_msg = await channel.send(embed=embed, file=data_file)
+            
+            # Unpin previous anchor
+            old_anchor_id = data["config"].get("data_anchor_message_id")
+            if old_anchor_id:
+                try:
+                    old_msg = await channel.fetch_message(int(old_anchor_id))
+                    await old_msg.unpin(reason="Superseded by newer data snapshot")
+                except (discord.NotFound, discord.HTTPException):
+                    pass
+                    
+            # Pin new anchor
+            try:
+                await new_msg.pin(reason="Latest bot data snapshot")
+                data["config"]["data_anchor_message_id"] = str(new_msg.id)
+                # Synchronously write the anchor ID to avoid re-triggering save_data
+                with open(TEMP_FILE, "w", encoding="utf-8") as f:
+                    json.dump(data, f, indent=4, ensure_ascii=False)
+                os.replace(TEMP_FILE, DATA_FILE)
+            except discord.HTTPException:
+                pass
+                
+            return new_msg
+        except Exception as e:
+            print(f"[notify_data_channel] WARN: failed to post data snapshot: {type(e).__name__}: {e}")
+            return None
 
 async def ensure_grade_role(guild: discord.Guild, grade_label: str, hex_color: str, data: dict) -> discord.Role | None:
     color_int = hex_to_int(hex_color)
@@ -483,6 +554,56 @@ async def sync_grade_role_for_owner(
 # ==========================================
 # 3. UTILITY FUNCTIONS & SHARED VIEWS
 # ==========================================
+
+async def upload_to_asset_channel(bot_instance: discord.Client, oc_name: str, oc_id: str, image_url: str) -> str | None:
+    """
+    Download image_url and re-host it in #assets. Returns the stable proxy_url.
+    Returns None on any failure. Never raises.
+    """
+    data = load_data()
+    asset_channel_id = data["config"].get("asset_channel")
+    if not asset_channel_id:
+        # Attempt live resolution
+        for guild in bot_instance.guilds:
+            ch = discord.utils.get(guild.text_channels, name="assets")
+            if ch:
+                asset_channel_id = ch.id
+                data["config"]["asset_channel"] = ch.id
+                save_data(data, reason="auto_resolved_asset_channel")
+                break
+    if not asset_channel_id:
+        return None
+
+    channel = bot_instance.get_channel(int(asset_channel_id))
+    if not channel:
+        try:
+            channel = await bot_instance.fetch_channel(int(asset_channel_id))
+        except Exception:
+            return None
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(image_url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                if resp.status != 200:
+                    return None
+                img_bytes = await resp.read()
+                ext = "png"
+                if "." in image_url:
+                    possible_ext = image_url.split(".")[-1].split("?")[0].lower()
+                    if len(possible_ext) <= 5 and possible_ext.isalnum():
+                        ext = possible_ext
+                filename = f"{oc_id}_{datetime.now(KST).strftime('%Y%m%d_%H%M%S')}.{ext}"
+                new_file = discord.File(fp=io.BytesIO(img_bytes), filename=filename)
+                msg = await channel.send(
+                    content=f"[OC Asset] `{oc_name}` (id:{oc_id})",
+                    file=new_file
+                )
+                att = msg.attachments[0]
+                return att.proxy_url or att.url
+    except Exception as e:
+        print(f"upload_to_asset_channel: failed for {oc_name}: {e}")
+        return None
+
 async def auto_resolve_config(guild: discord.Guild | None, data: dict) -> bool:
     if not guild:
         return False
@@ -1243,30 +1364,63 @@ class SurvivalBot(commands.Bot):
     async def on_ready(self):
         print(f"Logged in as {self.user} (ID: {self.user.id}). Running startup sequence...")
 
-        # ── STEP 1: Bootstrap the data_channel_id from environment before hydration ──
+        # ── STEP 1: Bootstrap the channels from environment before hydration ──
         # This solves the bootstrap deadlock: if data.json is blank (fresh deploy),
-        # we seed the channel ID from the environment variable before attempting to
+        # we seed the channel IDs from the environment variables before attempting to
         # fetch anything from Discord.
+        asset_channel_env = os.getenv("ASSET_CHANNEL_ID", "").strip()
         data_channel_env = os.getenv("DATA_CHANNEL_ID", "").strip()
-        if data_channel_env:
-            local_data = load_data()
-            if not local_data["config"].get("data_channel_id"):
-                local_data["config"]["data_channel_id"] = data_channel_env
-                # Write synchronously (no notify needed — we're about to hydrate over it)
-                with open(TEMP_FILE, "w", encoding="utf-8") as f:
-                    json.dump(local_data, f, indent=4)
-                os.replace(TEMP_FILE, DATA_FILE)
-                print(f"Bootstrapped data_channel_id from DATA_CHANNEL_ID env var: {data_channel_env}")
+
+        local_data = load_data()
+        dirty = False
+
+        if data_channel_env and not local_data["config"].get("data_channel_id"):
+            local_data["config"]["data_channel_id"] = data_channel_env
+            dirty = True
+
+        if asset_channel_env and not local_data["config"].get("asset_channel"):
+            local_data["config"]["asset_channel"] = asset_channel_env
+            dirty = True
+
+        if dirty:
+            with open(TEMP_FILE, "w", encoding="utf-8") as f:
+                json.dump(local_data, f, indent=4)
+            os.replace(TEMP_FILE, DATA_FILE)
+            print(f"Bootstrapped channels from env: data={data_channel_env}, asset={asset_channel_env}")
 
         # ── STEP 2: Hydrate from Discord channel (cache is now warm) ──────────────
         hydrated_data = await load_data_from_channel(self)
+        
+        # Increment deployment count and synchronously write
+        hydrated_data["config"]["deployment_count"] = hydrated_data["config"].get("deployment_count", 0) + 1
+        with open(TEMP_FILE, "w", encoding="utf-8") as f:
+            json.dump(hydrated_data, f, indent=4)
+        os.replace(TEMP_FILE, DATA_FILE)
+        print(f"Deployment #{hydrated_data['config']['deployment_count']} ready.")
 
-        # ── STEP 3: Register persistent views for all known feed posts ─────────────
+        # ── STEP 3: Alert if Hydration Failed ──
+        oc_count = len(hydrated_data.get("ocs", {}))
+        if oc_count == 0 and hydrated_data["config"].get("deployment_count", 0) > 1:
+            for guild in self.guilds:
+                data_ch_id = hydrated_data["config"].get("data_channel_id")
+                if data_ch_id:
+                    ch = self.get_channel(int(data_ch_id))
+                    if ch:
+                        await ch.send(embed=get_embed(
+                            "⚠️ Hydration Warning",
+                            "Bot restarted but **no OC data was loaded**. This may indicate a hydration failure.\n"
+                            "Check that the pinned data snapshot in this channel is valid and accessible.\n"
+                            "If data was lost, use `/backup` to restore from the backup channel.",
+                            "error",
+                            show_footer=True
+                        ))
+
+        # ── STEP 4: Register persistent views for all known feed posts ─────────────
         for feed_list in hydrated_data.get("feeds", {}).values():
             for post in feed_list:
                 self.add_view(FeedPostView(post["post_id"]))
 
-        # ── STEP 4: Auto-resolve config (guild roles/channels) ───────────────────
+        # ── STEP 5: Auto-resolve config (guild roles/channels) ───────────────────
         changed = False
         for guild in self.guilds:
             if await auto_resolve_config(guild, hydrated_data):
@@ -1274,14 +1428,13 @@ class SurvivalBot(commands.Bot):
         if changed:
             save_data(hydrated_data, reason="auto_resolve_startup", actor=None)
 
-        # ── STEP 5: Start background scheduler ────────────────────────────────────
+        # ── STEP 6: Start background scheduler ────────────────────────────────────
         if not voting_scheduler.is_running():
             voting_scheduler.start()
             
         if not asset_revalidation_task.is_running():
             asset_revalidation_task.start()
 
-        oc_count = len(hydrated_data.get("ocs", {}))
         post_count = sum(len(v) for v in hydrated_data.get("feeds", {}).values())
         print(f"Startup complete. Loaded {oc_count} OC(s), {post_count} feed post(s).")
 
@@ -1312,16 +1465,46 @@ class ConfigCog(commands.Cog):
     @app_commands.command(name="setup", description="Initial bot configuration (Dev only)")
     @app_commands.describe(
         timezone="Your server's IANA timezone name, e.g. 'Asia/Seoul' or 'America/New_York'. Used for all timestamps.",
-        announce_channel="The text channel where voting results, eliminations, and announcements will be posted."
+        announce_channel="The text channel where voting results, eliminations, and announcements will be posted.",
+        force="Force a full re-setup even if already configured."
     )
     @app_commands.choices(timezone=TIMEZONE_CHOICES)
     @is_dev()
-    async def setup(self, interaction: discord.Interaction, timezone: app_commands.Choice[str], announce_channel: discord.TextChannel):
+    async def setup(self, interaction: discord.Interaction, timezone: app_commands.Choice[str], announce_channel: discord.TextChannel, force: bool = False):
         data = load_data()
         await auto_resolve_config(interaction.guild, data)
         
+        already_configured = (
+            data["config"].get("announcement_channel_id") is not None
+            and data["config"].get("timezone") not in (None, "UTC", "")
+            and data["config"].get("dev_role_id") is not None
+        )
+
+        if already_configured and not force:
+            current_tz    = data["config"].get("timezone")
+            current_ann   = data["config"].get("announcement_channel_id")
+            ann_str       = f"<#{current_ann}>" if current_ann else "Not set"
+            asset_str     = f"<#{data['config'].get('asset_channel')}>" if data["config"].get("asset_channel") else "Not set"
+            data_str      = f"<#{data['config'].get('data_channel_id')}>" if data["config"].get("data_channel_id") else "Not set"
+
+            return await interaction.response.send_message(
+                embed=get_embed(
+                    "⚙️ Already Configured",
+                    f"This bot already has a prior configuration loaded from the data channel.\n\n"
+                    f"**Current Timezone:** `{current_tz}`\n"
+                    f"**Announce Channel:** {ann_str}\n"
+                    f"**Asset Channel:** {asset_str}\n"
+                    f"**Data Channel:** {data_str}\n\n"
+                    f"To update individual values, use `/config set` or the dedicated `/set*` commands.\n"
+                    f"To force a full re-setup and overwrite all values, re-run `/setup` with `force: True`.",
+                    "warning"
+                ),
+                ephemeral=True
+            )
+
         data["config"]["timezone"] = timezone.value
         data["config"]["announcement_channel_id"] = announce_channel.id
+        data["config"]["setup_completed_at"] = now().isoformat()
         save_data(data, reason="setup_completed", actor=interaction.user)
         
         dev_role_str = f"<@&{data['config']['dev_role_id']}>" if data["config"].get("dev_role_id") else "Not configured"
@@ -1618,25 +1801,14 @@ class RegistrationCog(commands.Cog):
         if profile_picture:
             if not profile_picture.content_type or not profile_picture.content_type.startswith("image/"):
                 return await interaction.response.send_message(embed=get_embed("Invalid File", "Hmm, that file type isn't supported. Please attach an image (PNG, JPG, GIF, WEBP)!", "error"), ephemeral=True)
-            if not data["config"].get("asset_channel"):
-                return await interaction.response.send_message(embed=get_embed("Warning", "There's no asset channel set up yet, so profile pictures can't be saved at the moment. A staff member will need to run **/setassetchannel** to enable this — try registering without a picture for now!", "warning"), ephemeral=True)
 
         await interaction.response.defer()
 
+        oc_id = str(uuid.uuid4())
         profile_picture_url = None
         if profile_picture:
-            asset_ch = self.bot.get_channel(int(data["config"]["asset_channel"]))
-            if asset_ch:
-                img_bytes = await profile_picture.read()
-                file = discord.File(fp=io.BytesIO(img_bytes), filename=profile_picture.filename)
-                asset_msg = await asset_ch.send(
-                    content=f"[OC Asset] `{name}` — owner: <@{interaction.user.id}>",
-                    file=file
-                )
-                att = asset_msg.attachments[0]
-                profile_picture_url = att.proxy_url or att.url
+            profile_picture_url = await upload_to_asset_channel(self.bot, name, oc_id, profile_picture.url)
 
-        oc_id = str(uuid.uuid4())
         new_oc = {
             "id": oc_id,
             "name": name,
@@ -1731,22 +1903,13 @@ class RegistrationCog(commands.Cog):
         if profile_picture is not None:
             if not profile_picture.content_type or not profile_picture.content_type.startswith("image/"):
                 return await interaction.response.send_message(embed=get_embed("Invalid File", "Hmm, that file type isn't supported. Please attach an image (PNG, JPG, GIF, WEBP)!", "error"), ephemeral=True)
-            if not data["config"].get("asset_channel"):
-                return await interaction.response.send_message(embed=get_embed("Warning", "There's no asset channel set up yet, so profile pictures can't be saved at the moment.", "warning"), ephemeral=True)
         
         await interaction.response.defer()
         
         if profile_picture is not None:
-            asset_ch = self.bot.get_channel(int(data["config"]["asset_channel"]))
-            if asset_ch:
-                img_bytes = await profile_picture.read()
-                file = discord.File(fp=io.BytesIO(img_bytes), filename=profile_picture.filename)
-                asset_msg = await asset_ch.send(
-                    content=f"[OC Asset] `{name or oc['name']}` — owner: <@{interaction.user.id}>",
-                    file=file
-                )
-                att = asset_msg.attachments[0]
-                oc["profile_picture_url"] = att.proxy_url or att.url
+            new_url = await upload_to_asset_channel(self.bot, name or oc["name"], oc["id"], profile_picture.url)
+            if new_url:
+                oc["profile_picture_url"] = new_url
 
         if name is not None: oc["name"] = name
         if birthday_yyyy_mm_dd is not None: oc["birthday"] = birthday_yyyy_mm_dd
@@ -3100,7 +3263,7 @@ class PeerRankingCog(commands.Cog):
             except:
                 username = f"Unknown User (ID: {voter_id})"
                 
-            ranks_str = "\n".join([f"{i+1}. {data['ocs'][oid]['name']}" for i, oid in enumerate(ballot)])
+            ranks_str = "\n".join([f"{i+1}. {data['ocs'][oid]['name']}" for i, enumerate(ballot)])
             embed = discord.Embed(title=f"Ballot · @{username}", description=ranks_str, color=COLORS["neutral"])
             await announce_ch.send(embed=embed)
             await asyncio.sleep(random.uniform(1.0, 2.0))
@@ -3681,18 +3844,7 @@ async def asset_revalidation_task():
                         if oc["id"] in msg.content or oc["name"].lower() in msg.content.lower():
                             if msg.attachments:
                                 att = msg.attachments[0]
-                                # Re-post to generate a fresh, anchored URL
-                                img_bytes = await att.read()
-                                new_file = discord.File(
-                                    fp=io.BytesIO(img_bytes),
-                                    filename=att.filename
-                                )
-                                new_msg = await asset_ch.send(
-                                    content=f"[OC Asset — Re-anchored] `{oc['name']}` (id:{oc['id']})",
-                                    file=new_file
-                                )
-                                new_att = new_msg.attachments[0]
-                                new_url = new_att.proxy_url or new_att.url
+                                new_url = await upload_to_asset_channel(bot, oc["name"], oc["id"], att.url)
                                 break
                 except Exception as e:
                     print(f"asset_revalidation_task: error re-fetching asset for {oc['name']}: {e}")
@@ -3815,23 +3967,35 @@ def run_health_server():
     server.serve_forever()
 
 if __name__ == "__main__":
+    """
+    Required env vars:
+      BOT_TOKEN          — Discord bot token
+
+    Strongly recommended env vars (prevent cold-start data loss):
+      DATA_CHANNEL_ID    — Numeric Discord channel ID of #data
+                           Seeds data.json on fresh container before hydration.
+      ASSET_CHANNEL_ID   — Numeric Discord channel ID of #assets
+                           Seeds asset_channel config on fresh container.
+
+    Optional:
+      PORT               — HTTP health-check port (default: 8080)
+    """
     TOKEN = os.getenv("BOT_TOKEN")
     if not TOKEN:
         print("CRITICAL: BOT_TOKEN environment variable missing.")
         exit(1)
 
-    # DATA_CHANNEL_ID: Optional. Set this to the numeric Discord channel ID of your
-    # designated data channel. When set, the bot will use this to seed data_channel_id
-    # in data.json on a fresh container (bootstrap), resolving the chicken-and-egg
-    # problem where data.json is blank but the channel ID lives inside data.json.
-    # Format: DATA_CHANNEL_ID=123456789012345678
-    data_channel_env = os.getenv("DATA_CHANNEL_ID", "").strip()
-    if not data_channel_env:
+    # Note: DATA_CHANNEL_ID and ASSET_CHANNEL_ID are now fetched and loaded directly
+    # within the on_ready() block (Step 1) so we log those actions dynamically at runtime.
+    if not os.getenv("DATA_CHANNEL_ID"):
         print("WARNING: DATA_CHANNEL_ID env var is not set. On a fresh container, "
               "data hydration from Discord will be skipped (no channel ID to read from). "
               "Set DATA_CHANNEL_ID to your data channel's numeric ID to enable full persistence.")
     else:
-        print(f"DATA_CHANNEL_ID is set to: {data_channel_env}")
+        print(f"DATA_CHANNEL_ID is set to: {os.getenv('DATA_CHANNEL_ID')}")
+
+    if not os.getenv("ASSET_CHANNEL_ID"):
+        print("WARNING: ASSET_CHANNEL_ID env var is not set. Setup will rely on auto-resolution.")
 
     health_thread = threading.Thread(target=run_health_server, daemon=True)
     health_thread.start()
