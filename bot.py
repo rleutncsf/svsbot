@@ -197,6 +197,7 @@ DEFAULT_SCHEMA = {
         "asset_channel": None,
         "feed_channel": None,
         "backup_channel_id": None,
+        "backup_anchor_message_id": None,
         "data_channel_id": None,
         "rankings_channel_id": None,
         "data_anchor_message_id": None,
@@ -256,7 +257,7 @@ def migrate_schema(data: dict) -> bool:
             data["config"][key] = val
             modified = True
 
-    for key in ("data_anchor_message_id", "setup_completed_at"):
+    for key in ("data_anchor_message_id", "backup_anchor_message_id", "setup_completed_at"):
         if key not in data["config"]:
             data["config"][key] = None
             modified = True
@@ -453,6 +454,7 @@ def save_data(data: dict, reason: str = "routine update", actor: discord.User | 
     try:
         loop = asyncio.get_running_loop()
         loop.create_task(notify_data_channel(data, reason, actor))
+        loop.create_task(push_backup_to_discord(data, reason=reason))
     except RuntimeError:
         pass  # No running event loop (e.g. called during synchronous startup)
 
@@ -464,40 +466,69 @@ async def push_backup_to_discord(data: dict, reason: str = "mutation") -> None:
     try:
         payload_bytes = json.dumps(data, indent=4, ensure_ascii=False).encode("utf-8")
         if len(payload_bytes) > 8_000_000:
-            print("push_backup_to_discord: payload exceeds 8 MB limit, skipping upload.")
+            print("[push_backup_to_discord] Payload exceeds 8 MB limit, skipping.")
             return
 
+        # Resolve backup channel: prefer configured backup_channel_id, fall back to name lookup
+        backup_ch = None
+        configured_id = data["config"].get("backup_channel_id")
         for guild in bot.guilds:
-            ch = discord.utils.get(guild.text_channels, name="bot-db-backup")
-            if ch:
-                timestamp_str = datetime.now(KST).strftime('%Y%m%d_%H%M%S')
-                file = discord.File(
-                    io.BytesIO(payload_bytes),
-                    filename=f"data_{timestamp_str}.json"
-                )
-                new_msg = await ch.send(
-                    f"[BACKUP] {reason} — {datetime.now(KST).strftime('%Y-%m-%d %H:%M:%S KST')}",
-                    file=file
-                )
-                DATA_DIRTY = False
+            if configured_id:
+                backup_ch = guild.get_channel(int(configured_id))
+                if backup_ch is None:
+                    try:
+                        backup_ch = await guild.fetch_channel(int(configured_id))
+                    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                        backup_ch = None
+            if backup_ch is None:
+                backup_ch = discord.utils.get(guild.text_channels, name="bot-db-backup")
+            if backup_ch:
+                break
 
-                try:
-                    await ch.purge(
-                        limit=50,
-                        check=lambda m: m.author == bot.user and m.id != new_msg.id
-                    )
-                except (discord.Forbidden, discord.HTTPException):
-                    pass
+        if backup_ch is None:
+            print("[push_backup_to_discord] No backup channel found. Skipping.")
+            return
 
-                return
+        # Step 1: Send the new backup file first
+        timestamp_str = datetime.now(KST).strftime('%Y%m%d_%H%M%S')
+        file = discord.File(
+            io.BytesIO(payload_bytes),
+            filename=f"data_{timestamp_str}.json"
+        )
+        new_msg = await backup_ch.send(
+            f"[BACKUP] `{reason}` — {datetime.now(KST).strftime('%Y-%m-%d %H:%M:%S KST')}",
+            file=file
+        )
+        DATA_DIRTY = False
+
+        # Step 2: Delete the *previous* backup message by stored anchor ID (surgical, not bulk)
+        old_anchor_id = data["config"].get("backup_anchor_message_id")
+        if old_anchor_id:
+            try:
+                old_msg = await backup_ch.fetch_message(int(old_anchor_id))
+                await old_msg.delete()
+            except discord.NotFound:
+                pass  # Already deleted or never existed — harmless
+            except (discord.Forbidden, discord.HTTPException) as e:
+                print(f"[push_backup_to_discord] Could not delete previous backup message {old_anchor_id}: {e}")
+
+        # Step 3: Persist the new anchor ID directly (no save_data to avoid recursion)
+        data["config"]["backup_anchor_message_id"] = str(new_msg.id)
+        with open(TEMP_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=4, ensure_ascii=False)
+        os.replace(TEMP_FILE, DATA_FILE)
+
     except Exception as e:
-        print(f"[push_backup_to_discord] failed: {type(e).__name__}: {e}")
+        print(f"[push_backup_to_discord] Failed: {type(e).__name__}: {e}")
 
 async def save_and_backup(data: dict, reason: str = "mutation") -> None:
-    global DATA_DIRTY
-    DATA_DIRTY = True
+    """
+    Semantic alias retained for backward compatibility.
+    save_data() now internally schedules both notify_data_channel
+    and push_backup_to_discord as async tasks, so no explicit
+    push_backup_to_discord call is needed here.
+    """
     save_data(data, reason=reason)
-    await push_backup_to_discord(data, reason=reason)
 
 async def notify_data_channel(data: dict, reason: str, actor: discord.User | discord.Member | None = None) -> discord.Message | None:
     async with _data_channel_lock:
@@ -4155,6 +4186,7 @@ async def auto_backup_db():
         return
     try:
         data = load_data()
+        print(f"[auto_backup_db] DATA_DIRTY=True — triggering watchdog backup.")
         await push_backup_to_discord(data, reason="auto-watchdog")
     except Exception as e:
         print(f"[auto_backup_db] Watchdog backup failed: {type(e).__name__}: {e}")
