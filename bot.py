@@ -335,35 +335,59 @@ def load_data():
         print("CRITICAL ERROR: JSON is malformed. Halting to prevent data overwrite.")
         os._exit(1)
 
-async def load_data_from_channel(bot_instance: discord.Client):
+async def load_data_from_channel(bot_instance: discord.Client) -> dict:
+    """
+    Rehydrate data.json from the most recent JSON attachment posted to the
+    designated data channel. Uses fetch_channel (HTTP, cache-bypassing) to
+    guarantee the channel object is always resolved, even after a cold restart.
+    Scans up to 200 messages and returns the first valid JSON attachment found.
+    Falls back to local data.json if no attachment is found or the channel is
+    unreachable.
+    """
     data = load_data()
     channel_id = data["config"].get("data_channel_id")
     if not channel_id:
+        print("load_data_from_channel: data_channel_id not configured; skipping hydration.")
         return data
-        
-    channel = bot_instance.get_channel(int(channel_id))
-    if not channel:
-        return data
-        
+
+    channel = None
     try:
-        async for message in channel.history(limit=50, oldest_first=False):
+        # Prefer cache lookup first (free); fall back to HTTP fetch if miss.
+        channel = bot_instance.get_channel(int(channel_id))
+        if channel is None:
+            channel = await bot_instance.fetch_channel(int(channel_id))
+    except (discord.NotFound, discord.Forbidden, discord.HTTPException) as e:
+        print(f"load_data_from_channel: could not resolve channel {channel_id}: {e}")
+        return data
+
+    try:
+        async for message in channel.history(limit=200, oldest_first=False):
             for attachment in message.attachments:
-                if attachment.filename.endswith(".json"):
+                if not attachment.filename.endswith(".json"):
+                    continue
+                try:
                     json_bytes = await attachment.read()
                     fetched_data = json.loads(json_bytes)
-                    
-                    migrate_schema(fetched_data)
-                    
-                    # Persist locally
-                    with open(TEMP_FILE, "w", encoding="utf-8") as f:
-                        json.dump(fetched_data, f, indent=4)
-                    os.replace(TEMP_FILE, DATA_FILE)
-                    
-                    print(f"Successfully rehydrated data from #{channel.name} ({attachment.filename})")
-                    return fetched_data
+                except (json.JSONDecodeError, discord.HTTPException) as parse_err:
+                    print(f"load_data_from_channel: skipping malformed attachment '{attachment.filename}': {parse_err}")
+                    continue
+
+                migrate_schema(fetched_data)
+
+                # Atomic write to disk so load_data() reflects the hydrated state
+                with open(TEMP_FILE, "w", encoding="utf-8") as f:
+                    json.dump(fetched_data, f, indent=4)
+                os.replace(TEMP_FILE, DATA_FILE)
+
+                oc_count = len(fetched_data.get("ocs", {}))
+                print(f"Rehydration successful: loaded '{attachment.filename}' from #{channel.name} "
+                      f"(message {message.id}). {oc_count} OC(s) restored.")
+                return fetched_data
+
+        print("load_data_from_channel: no valid JSON attachment found in the last 200 messages. Using local data.")
     except Exception as e:
-        print(f"Failed to hydrate from channel: {e}")
-        
+        print(f"load_data_from_channel: unexpected error during channel scan: {e}")
+
     return data
 
 def save_data(data: dict, reason: str = "routine update", actor: discord.User | discord.Member | None = None):
@@ -1208,28 +1232,50 @@ class SurvivalBot(commands.Bot):
         await self.add_cog(HelpCog(self))
         await self.add_cog(FeedCog(self))
 
-        await load_data_from_channel(self)
-        asyncio.create_task(self.deferred_auto_resolve())
+        await self.tree.sync()
+        print("Commands synced. Deferring data hydration until bot is fully ready.")
 
-        data = load_data()
-        for feed_list in data.get("feeds", {}).values():
+    async def on_ready(self):
+        print(f"Logged in as {self.user} (ID: {self.user.id}). Running startup sequence...")
+
+        # ── STEP 1: Bootstrap the data_channel_id from environment before hydration ──
+        # This solves the bootstrap deadlock: if data.json is blank (fresh deploy),
+        # we seed the channel ID from the environment variable before attempting to
+        # fetch anything from Discord.
+        data_channel_env = os.getenv("DATA_CHANNEL_ID", "").strip()
+        if data_channel_env:
+            local_data = load_data()
+            if not local_data["config"].get("data_channel_id"):
+                local_data["config"]["data_channel_id"] = data_channel_env
+                # Write synchronously (no notify needed — we're about to hydrate over it)
+                with open(TEMP_FILE, "w", encoding="utf-8") as f:
+                    json.dump(local_data, f, indent=4)
+                os.replace(TEMP_FILE, DATA_FILE)
+                print(f"Bootstrapped data_channel_id from DATA_CHANNEL_ID env var: {data_channel_env}")
+
+        # ── STEP 2: Hydrate from Discord channel (cache is now warm) ──────────────
+        hydrated_data = await load_data_from_channel(self)
+
+        # ── STEP 3: Register persistent views for all known feed posts ─────────────
+        for feed_list in hydrated_data.get("feeds", {}).values():
             for post in feed_list:
                 self.add_view(FeedPostView(post["post_id"]))
 
-        await self.tree.sync()
-        post_count = sum(len(v) for v in data.get("feeds", {}).values())
-        print(f"Bot Started & Commands Synced. Loaded {len(data.get('ocs', {}))} OCs, {post_count} feed post(s).")
-        voting_scheduler.start()
-
-    async def deferred_auto_resolve(self):
-        await self.wait_until_ready()
-        data = load_data()
+        # ── STEP 4: Auto-resolve config (guild roles/channels) ───────────────────
         changed = False
         for guild in self.guilds:
-            if await auto_resolve_config(guild, data):
+            if await auto_resolve_config(guild, hydrated_data):
                 changed = True
         if changed:
-            save_data(data, reason="auto_resolve_startup", actor=None)
+            save_data(hydrated_data, reason="auto_resolve_startup", actor=None)
+
+        # ── STEP 5: Start background scheduler ────────────────────────────────────
+        if not voting_scheduler.is_running():
+            voting_scheduler.start()
+
+        oc_count = len(hydrated_data.get("ocs", {}))
+        post_count = sum(len(v) for v in hydrated_data.get("feeds", {}).values())
+        print(f"Startup complete. Loaded {oc_count} OC(s), {post_count} feed post(s).")
 
 bot = SurvivalBot()
 
@@ -3598,6 +3644,19 @@ if __name__ == "__main__":
     if not TOKEN:
         print("CRITICAL: BOT_TOKEN environment variable missing.")
         exit(1)
+
+    # DATA_CHANNEL_ID: Optional. Set this to the numeric Discord channel ID of your
+    # designated data channel. When set, the bot will use this to seed data_channel_id
+    # in data.json on a fresh container (bootstrap), resolving the chicken-and-egg
+    # problem where data.json is blank but the channel ID lives inside data.json.
+    # Format: DATA_CHANNEL_ID=123456789012345678
+    data_channel_env = os.getenv("DATA_CHANNEL_ID", "").strip()
+    if not data_channel_env:
+        print("WARNING: DATA_CHANNEL_ID env var is not set. On a fresh container, "
+              "data hydration from Discord will be skipped (no channel ID to read from). "
+              "Set DATA_CHANNEL_ID to your data channel's numeric ID to enable full persistence.")
+    else:
+        print(f"DATA_CHANNEL_ID is set to: {data_channel_env}")
 
     health_thread = threading.Thread(target=run_health_server, daemon=True)
     health_thread.start()
