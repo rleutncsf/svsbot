@@ -77,6 +77,7 @@ HELP_SECTIONS = {
         ],
         "dev_commands": [
             ("/deleteoc", "oc_name", "🔒 Permanently hard-delete an OC from all data (active or archived). Irreversible."),
+            ("/assignoc", "oc_name user", "🔒 Reassign an existing OC to a different Discord user. Respects the OC cap."),
         ]
     },
     "voting": {
@@ -1023,7 +1024,7 @@ class ConfirmResetView(discord.ui.View):
 
         if not active_ocs:
             return await interaction.response.edit_message(
-                embed=get_embed("Nothing to Reset", "There are no active Trainees with points to reset right now!", "warning"),
+                embed=get_embed("nothing to reset", "there are no active trainees with points to reset right now — all clear!", "warning"),
                 view=self
             )
 
@@ -1168,7 +1169,7 @@ class ConfirmDeleteOCView(discord.ui.View):
         
         oc = data["ocs"].get(self.oc_id) or data["archived_ocs"].get(self.oc_id)
         if not oc:
-            return await interaction.response.edit_message(embed=get_embed("Error", "OC not found in data anymore.", "error"), view=self)
+            return await interaction.response.edit_message(embed=get_embed("uh oh", "couldn't find that oc in the data anymore — they may have already been removed.", "error"), view=self)
 
         purged_summary = []
         
@@ -1651,7 +1652,7 @@ bot = SurvivalBot()
 @bot.tree.error
 async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
     if isinstance(error, app_commands.CheckFailure):
-        embed = get_embed("Access Denied", "this command is for staff only. if you think you should have access, reach out to a dev.", "error")
+        embed = get_embed("Access Denied", "hey, that one's staff-only! if you think you should have access, just reach out to a dev.", "error")
         await interaction.response.send_message(embed=embed, ephemeral=True)
     else:
         embed = get_embed("System Error", f"oops! something went wrong on our end. here's the error detail in case you need it: {str(error)}", "error")
@@ -1897,7 +1898,7 @@ class ConfigCog(commands.Cog):
     # Whitelist of config keys that are safe to edit via /config set.
     # Maps key name → (type_converter, description, valid_range_hint)
     _CONFIG_SET_WHITELIST = {
-        "oc_cap":                (int,   "Max OCs per user",                         "integer ≥ 1"),
+        "oc_cap":                (int,   "Max OCs per user (0 = unlimited)",         "integer ≥ 0"),
         "allow_negative_points": (bool,  "Allow OC points to go below 0",            "true / false"),
         "allow_multi_vote":      (bool,  "Allow multiple votes on one OC per round",  "true / false"),
         "reveal_color":          (str,   "Hex colour for the ranking reveal embed",   "#RRGGBB"),
@@ -1944,8 +1945,8 @@ class ConfigCog(commands.Cog):
                 converted = value
 
             # Domain validation
-            if key == "oc_cap" and converted < 1:
-                raise ValueError("oc_cap must be ≥ 1")
+            if key == "oc_cap" and converted < 0:
+                raise ValueError("oc_cap must be 0 (unlimited) or a positive integer")
             if key == "reveal_page_size" and not (1 <= converted <= 25):
                 raise ValueError("reveal_page_size must be 1–25")
             if key == "reveal_color":
@@ -1971,7 +1972,7 @@ class ConfigCog(commands.Cog):
 
         await interaction.response.send_message(
             embed=get_embed(
-                "Config Updated",
+                "config updated!",
                 f"**`{key}`** ({desc})\n`{old_value}` → `{converted}`",
                 "success"
             ),
@@ -2024,8 +2025,9 @@ class RegistrationCog(commands.Cog):
 
         user_id = str(interaction.user.id)
         current_ocs = len([oc for oc in data["ocs"].values() if oc["owner_id"] == user_id])
-        if current_ocs >= data["config"]["oc_cap"]:
-            return await interaction.response.send_message(embed=get_embed("limit reached", f"looks like you've already got {data['config']['oc_cap']} trainees — that's the maximum allowed right now! feel free to reach out to a staff member if you have questions.", "error"), ephemeral=True)
+        oc_cap = data["config"]["oc_cap"]
+        if oc_cap != 0 and current_ocs >= oc_cap:
+            return await interaction.response.send_message(embed=get_embed("limit reached", f"looks like you've already got {oc_cap} trainees — that's the maximum allowed right now! feel free to reach out to a staff member if you have questions.", "error"), ephemeral=True)
         
         for oc in data["ocs"].values():
             if oc["owner_id"] == user_id and oc["name"].lower() == name.lower():
@@ -2176,7 +2178,7 @@ class RegistrationCog(commands.Cog):
                     
         if not oc:
             return await interaction.response.send_message(
-                embed=get_embed("Not Found", f"Could not find an active or archived OC named '{oc_name}'.", "error"), 
+                embed=get_embed("not found", f"couldn't find any active or archived oc named **{oc_name}**. double-check the spelling and try again!", "error"), 
                 ephemeral=True
             )
             
@@ -2190,6 +2192,61 @@ class RegistrationCog(commands.Cog):
         )
         msg = await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
         view.message = await interaction.original_response()
+
+    @app_commands.command(name="assignoc", description="[DEV] Reassign an existing OC to a different user.")
+    @app_commands.describe(
+        oc_name="The exact name of the OC to reassign.",
+        user="The Discord user who will become the new owner of this OC."
+    )
+    @is_dev()
+    async def assignoc(self, interaction: discord.Interaction, oc_name: str, user: discord.Member):
+        data = load_data()
+        oc = find_oc(oc_name, data)
+
+        if not oc:
+            return await interaction.response.send_message(
+                embed=get_embed("not found", f"couldn't find any active oc named **{oc_name}**. double-check the spelling and try again!", "error"),
+                ephemeral=True
+            )
+
+        old_owner_id   = oc["owner_id"]
+        old_owner_name = oc.get("owner_name", "unknown")
+        new_owner_id   = str(user.id)
+        new_owner_name = user.name
+
+        # Prevent redundant reassignment
+        if old_owner_id == new_owner_id:
+            return await interaction.response.send_message(
+                embed=get_embed("no change", f"**{oc['name']}** is already owned by {user.mention} — nothing to reassign.", "warning"),
+                ephemeral=True
+            )
+
+        # Enforce oc_cap for the new owner (0 = unlimited)
+        oc_cap = data["config"]["oc_cap"]
+        if oc_cap != 0:
+            new_owner_count = len([o for o in data["ocs"].values() if o["owner_id"] == new_owner_id])
+            if new_owner_count >= oc_cap:
+                return await interaction.response.send_message(
+                    embed=get_embed(
+                        "cap reached",
+                        f"{user.mention} already has **{new_owner_count}** trainee(s) — that's the current cap of **{oc_cap}**. raise the cap first if you need to assign more.",
+                        "error"
+                    ),
+                    ephemeral=True
+                )
+
+        oc["owner_id"]   = new_owner_id
+        oc["owner_name"] = new_owner_name
+        save_data(data, reason=f"assignoc: {oc['name']} → {new_owner_name}", actor=interaction.user)
+
+        await interaction.response.send_message(
+            embed=get_embed(
+                "oc reassigned",
+                f"**{oc['name']}** has been reassigned from <@{old_owner_id}> to {user.mention}.",
+                "success"
+            ),
+            ephemeral=True
+        )
 
     @app_commands.command(name="oc_all", description="Browse all currently registered Trainees")
     async def oc_all(self, interaction: discord.Interaction):
@@ -2363,8 +2420,7 @@ class RegistrationCog(commands.Cog):
             embed.color = COLORS["error"]
 
         age = calculate_age(oc["birthday"])
-        kst_label = "KST (GMT+9)"
-        embed.add_field(name="birthday / age", value=f"{format_date_display(oc['birthday'])} · {age} yrs ({kst_label})", inline=True)
+        embed.add_field(name="birthday / age", value=f"{format_date_display(oc['birthday'])} · {age} yrs", inline=True)
         embed.add_field(name="gender / pronouns", value=f"{oc['gender']} · {oc['pronouns']}", inline=True)
         embed.add_field(name="faceclaim", value=oc["faceclaim"], inline=True)
         embed.add_field(name="main skill", value=oc["main_skill"], inline=True)
@@ -2555,7 +2611,7 @@ class VotingCog(commands.Cog):
         
         date_args = [year, month, day]
         if any(a is None for a in date_args) and not all(a is None for a in date_args):
-            return await interaction.response.send_message(embed=get_embed("Error", "Provide all of year, month, and day together, or omit all to open immediately.", "error"), ephemeral=True)
+            return await interaction.response.send_message(embed=get_embed("incomplete date", "if you're scheduling a time, make sure to include year, month, *and* day together. or just skip them all to open voting right now!", "error"), ephemeral=True)
             
         if all(a is None for a in date_args):
             data["voting"]["is_open"] = True
@@ -2566,7 +2622,7 @@ class VotingCog(commands.Cog):
             data["voting"]["start_time"] = now().isoformat()
             data["voting"]["scheduled_open_time"] = None
             save_data(data, reason="voting_opened", actor=interaction.user)
-            await interaction.response.send_message(embed=get_embed("Voting Opened", "🗳️ Voting is now open! Members can start casting their votes.", "success"))
+            await interaction.response.send_message(embed=get_embed("voting's open! 🗳️", "let's go — voting is now live! members can start casting their votes.", "success"))
         else:
             try:
                 target_dt = datetime(year, month, day, hour, minute, tzinfo=KST)
@@ -2574,7 +2630,7 @@ class VotingCog(commands.Cog):
                 return await interaction.response.send_message(embed=get_embed("Error", f"Invalid date/time: {e}", "error"), ephemeral=True)
                 
             if target_dt <= datetime.now(KST):
-                return await interaction.response.send_message(embed=get_embed("Warning", "That time is in the past. Provide a future time or omit parameters to open immediately.", "warning"), ephemeral=True)
+                return await interaction.response.send_message(embed=get_embed("hold on", "that time has already passed! give a future time, or skip the date params entirely to open voting right now.", "warning"), ephemeral=True)
                 
             data["voting"]["scheduled_open_time"] = target_dt.isoformat()
             save_data(data, reason="voting_open_scheduled", actor=interaction.user)
