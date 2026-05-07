@@ -68,6 +68,7 @@ HELP_SECTIONS = {
             ("/oc_all", "", "Browse all currently active Trainees (paginated)."),
             ("/oc_eliminated", "", "View all eliminated Trainees."),
             ("/removeoc", "oc_name", "Permanently archive one of your own Trainees. Requires confirmation."),
+            ("/editoc", "oc_name [name] [birthday_yyyy_mm_dd] [gender] [pronouns] [faceclaim] [main_skill] [nationality] [ethnicity] [form_link] [profile_picture]", "Edit any field on one of your own Trainees."),
         ],
         "dev_commands": [
             ("/deleteoc", "oc_name", "🔒 Permanently hard-delete an OC from all data (active or archived). Irreversible."),
@@ -170,7 +171,7 @@ HELP_SECTIONS = {
             ("/setdatachannel", "channel", "🔒 Set the channel that receives automatic data-change notifications."),
             ("/backup", "", "🔒 Export the full data.json to the backup channel. Creates the channel automatically if it doesn't exist."),
             ("/setrevealpage", "size", "🔒 Set how many Trainees appear per reveal page (1–25)."),
-            ("/config setdebutslots", "slots [public]", "🔒 Mark the top N ranking positions as the debut line."),
+            ("/config setdebutslots", "", "🔒 [DEPRECATED] This command has been retired and is now a no-op."),
             ("/purgedata", "", "🔒 ⚠️ Permanently reset ALL data to factory defaults. Requires confirmation. Irreversible."),
         ]
     },
@@ -520,10 +521,10 @@ def format_dt(dt_str):
     return dt.strftime("%Y/%m/%d · %H:%M %Z")
 
 def format_date_display(date_str: str) -> str:
-    """Convert stored YYYY-MM-DD to display format YYYY/MM/DD. Returns original string on failure."""
+    """Convert stored YYYY-MM-DD to long display format: Month DD, YYYY."""
     try:
         dt = datetime.strptime(date_str, "%Y-%m-%d")
-        return dt.strftime("%Y/%m/%d")
+        return f"{dt.strftime('%B')} {dt.day}, {dt.year}"
     except (ValueError, TypeError):
         return date_str or "Unknown"
 
@@ -664,7 +665,6 @@ class ConfirmResetView(discord.ui.View):
     @discord.ui.button(label="✅ Confirm", style=discord.ButtonStyle.danger)
     async def confirm_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self._disable_all()
-
         data = load_data()
         active_ocs = [oc for oc in data["ocs"].values() if not oc.get("eliminated", False)]
 
@@ -674,7 +674,20 @@ class ConfirmResetView(discord.ui.View):
                 view=self
             )
 
-        # Zero out all points and write per-OC audit log entries
+        # ── STEP 1: Snapshot PRE-RESET rankings (before any mutation) ──────────
+        recalculate_ranks(data)   # ensure ranks are current right now
+        pre_reset_snap = [
+            {"oc_id": oc["id"], "rank": oc["current_rank"], "points": oc["total_points"]}
+            for oc in data["ocs"].values()
+            if not oc.get("eliminated", False)
+        ]
+        data["rank_snapshots"].append({
+            "timestamp": now().isoformat(),
+            "trigger":   "PRE_RESETALL_BASELINE",
+            "rankings":  pre_reset_snap
+        })
+
+        # ── STEP 2: Zero out all points and write audit log entries ─────────────
         for oc in active_ocs:
             pts_before = oc["total_points"]
             oc["voting_points"]  = 0
@@ -692,15 +705,19 @@ class ConfirmResetView(discord.ui.View):
                 "points_after":  0
             })
 
-        # Recalculate ranks (all tied at 0; tiebreak = registered_at)
+        # ── STEP 3: Recalculate ranks post-reset (tiebreak = registered_at) ─────
         recalculate_ranks(data)
 
-        # Write the new baseline snapshot
-        snap_data = [{"oc_id": oc["id"], "rank": oc["current_rank"], "points": oc["total_points"]} for oc in data["ocs"].values() if not oc.get("eliminated", False)]
+        # ── STEP 4: Snapshot POST-RESET state as the new forward baseline ───────
+        post_reset_snap = [
+            {"oc_id": oc["id"], "rank": oc["current_rank"], "points": oc["total_points"]}
+            for oc in data["ocs"].values()
+            if not oc.get("eliminated", False)
+        ]
         data["rank_snapshots"].append({
             "timestamp": now().isoformat(),
             "trigger":   SNAP_TRIGGER_RESETALL,
-            "rankings":  snap_data
+            "rankings":  post_reset_snap
         })
 
         save_data(data, reason="points_reset_all", actor=interaction.user)
@@ -709,8 +726,9 @@ class ConfirmResetView(discord.ui.View):
             embed=get_embed(
                 "✅ All Points Reset",
                 f"Points for **{len(active_ocs)} Trainee(s)** have been set to zero.\n"
+                f"Pre-reset rankings were snapshotted for historical reference.\n"
                 f"A new ranking baseline has been anchored.\n"
-                f"All future rank change indicators (▲/▼) will now compare against these post-reset rankings.",
+                f"All future rank change indicators (▲/▼) will now compare against these post-reset standings.",
                 "success"
             ),
             view=self
@@ -1116,7 +1134,7 @@ class CommentModal(discord.ui.Modal, title="Leave a Comment"):
 
         await interaction.response.send_message(embed=get_embed("Comment Posted", "💬 Your comment is posted! Head to the thread to continue the conversation.", "success"), ephemeral=True)
 
-async def _run_sequential_reveal(channel: discord.TextChannel, ocs_ordered: list, reveal_color: int, page_size: int, data: dict, show_debut_line: bool = True):
+async def _run_sequential_reveal(channel: discord.TextChannel, ocs_ordered: list, reveal_color: int, page_size: int, data: dict, show_debut_line: bool = True, hide_points: bool = False):
     pages = []
     batches = [ocs_ordered[i:i + page_size] for i in range(0, len(ocs_ordered), page_size)]
     
@@ -1142,7 +1160,8 @@ async def _run_sequential_reveal(channel: discord.TextChannel, ocs_ordered: list
             change = get_rank_change(oc["id"], oc.get("current_rank", 0), data)
             grade_str = f" [{oc['grade']}]" if oc.get('grade') else ""
             field_name = f"✦ Rank #{oc.get('current_rank', 0)}{grade_str}"
-            field_val = f"**{oc['name']}** · {oc['total_points']:,} pts\n<@{oc['owner_id']}> · {change}"
+            pts_str = "— pts" if hide_points else f"{oc['total_points']:,} pts"
+            field_val = f"**{oc['name']}** · {pts_str}\n<@{oc['owner_id']}> · {change}"
             
             single_embed = discord.Embed(color=reveal_color)
             single_embed.add_field(name=field_name, value=field_val, inline=False)
@@ -1370,22 +1389,23 @@ class ConfigCog(commands.Cog):
         save_data(data)
         await interaction.response.send_message(embed=get_embed("Success", f"Reveal page size set to {size}.", "success"), ephemeral=True)
 
-    @config_group.command(name="setdebutslots", description="[DEV] Set the number of trainees slated to debut")
+    @config_group.command(name="setdebutslots", description="[DEPRECATED] This command has been phased out.")
     @app_commands.describe(
-        slots="Number of top-ranking positions marked as the debut line.",
-        public="If True, the debut line separator appears during public reveals."
+        slots="(Deprecated — no longer used)",
+        public="(Deprecated — no longer used)"
     )
     @is_dev()
-    async def setdebutslots(self, interaction: discord.Interaction, slots: int, public: bool = True):
-        data = load_data()
-        active_ocs = [oc for oc in data["ocs"].values() if not oc.get("eliminated", False)]
-        if slots < 1 or slots > len(active_ocs):
-            return await interaction.response.send_message(embed=get_embed("Error", f"Slots must be between 1 and {len(active_ocs)}.", "error"), ephemeral=True)
-        
-        data["config"]["debut_slots"] = slots
-        data["config"]["debut_slots_public"] = public
-        save_data(data)
-        await interaction.response.send_message(embed=get_embed("Success", f"Debut line set to top {slots} trainee(s).\nDebut line visibility on public reveals: {public}.", "success"), ephemeral=True)
+    async def setdebutslots(self, interaction: discord.Interaction, slots: int = 0, public: bool = True):
+        await interaction.response.send_message(
+            embed=get_embed(
+                "⚠️ Command Deprecated",
+                "`/config setdebutslots` has been phased out and no longer modifies any data.\n\n"
+                "Debut slot configuration is now managed directly in the data file or through future tooling.\n"
+                "The existing `debut_slots` value in config remains unchanged.",
+                "warning"
+            ),
+            ephemeral=True
+        )
 
     @config_group.command(name="votingmultiplier", description="[DEV] Set the vote-to-points multiplier")
     @app_commands.describe(value="The multiplier applied to votes when closing a voting round. E.g. 2 means each vote is worth 2 points.")
@@ -1536,6 +1556,72 @@ class RegistrationCog(commands.Cog):
         )
         await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
         view.message = await interaction.original_response()
+
+    @app_commands.command(name="editoc", description="Edit any field on one of your own Trainees.")
+    @app_commands.describe(
+        oc_name="The exact name of the Trainee OC to edit.",
+        name="New name.",
+        birthday_yyyy_mm_dd="New date of birth (YYYY-MM-DD).",
+        gender="New gender identity.",
+        pronouns="New pronouns.",
+        faceclaim="New faceclaim.",
+        main_skill="New main skill.",
+        nationality="New nationality.",
+        ethnicity="New ethnicity.",
+        form_link="New profile/form link.",
+        profile_picture="New profile picture."
+    )
+    async def editoc(self, interaction: discord.Interaction, oc_name: str, name: str = None, birthday_yyyy_mm_dd: str = None, gender: str = None, pronouns: str = None, faceclaim: str = None, main_skill: str = None, nationality: str = None, ethnicity: str = None, form_link: str = None, profile_picture: discord.Attachment = None):
+        data = load_data()
+        oc = find_oc(oc_name, data)
+        if not oc:
+            return await interaction.response.send_message(embed=get_embed("Not Found", "Hmm, we couldn't find that Trainee in your roster. Double-check the name and try again!", "error"), ephemeral=True)
+        if oc["owner_id"] != str(interaction.user.id):
+            return await interaction.response.send_message(embed=get_embed("Permission Denied", "🔒 You can only edit your own Trainees!", "error"), ephemeral=True)
+        
+        if birthday_yyyy_mm_dd is not None:
+            try:
+                datetime.strptime(birthday_yyyy_mm_dd, "%Y-%m-%d")
+            except ValueError:
+                return await interaction.response.send_message(embed=get_embed("Invalid Date", "Birthday must be in YYYY-MM-DD format (e.g., 2003-07-14).", "error"), ephemeral=True)
+                
+        if name is not None and name.lower() != oc["name"].lower():
+            for other_oc in data["ocs"].values():
+                if other_oc["owner_id"] == str(interaction.user.id) and other_oc["id"] != oc["id"] and other_oc["name"].lower() == name.lower():
+                    return await interaction.response.send_message(embed=get_embed("Duplicate Name", f"⛔ You've already got a Trainee named **{name}**! Each of your OCs needs a unique name.", "error"), ephemeral=True)
+
+        if profile_picture is not None:
+            if not profile_picture.content_type or not profile_picture.content_type.startswith("image/"):
+                return await interaction.response.send_message(embed=get_embed("Invalid File", "Hmm, that file type isn't supported. Please attach an image (PNG, JPG, GIF, WEBP)!", "error"), ephemeral=True)
+            if not data["config"].get("asset_channel"):
+                return await interaction.response.send_message(embed=get_embed("Warning", "There's no asset channel set up yet, so profile pictures can't be saved at the moment.", "warning"), ephemeral=True)
+        
+        await interaction.response.defer()
+        
+        if profile_picture is not None:
+            asset_ch = self.bot.get_channel(int(data["config"]["asset_channel"]))
+            if asset_ch:
+                img_bytes = await profile_picture.read()
+                file = discord.File(fp=io.BytesIO(img_bytes), filename=profile_picture.filename)
+                asset_msg = await asset_ch.send(
+                    content=f"[OC Asset] `{name or oc['name']}` — owner: <@{interaction.user.id}>",
+                    file=file
+                )
+                oc["profile_picture_url"] = asset_msg.attachments[0].url
+
+        if name is not None: oc["name"] = name
+        if birthday_yyyy_mm_dd is not None: oc["birthday"] = birthday_yyyy_mm_dd
+        if gender is not None: oc["gender"] = gender
+        if pronouns is not None: oc["pronouns"] = pronouns
+        if faceclaim is not None: oc["faceclaim"] = faceclaim
+        if main_skill is not None: oc["main_skill"] = main_skill
+        if nationality is not None: oc["nationality"] = nationality
+        if ethnicity is not None: oc["ethnicity"] = ethnicity
+        if form_link is not None: oc["form_link"] = form_link
+        
+        save_data(data, reason="oc_edited", actor=interaction.user)
+        embed = self._build_profile_embed(oc, data)
+        await interaction.followup.send(content="✅ Trainee profile updated!", embed=embed)
 
     @app_commands.command(name="deleteoc", description="[DEV] Permanently and irreversibly delete an OC from all data")
     @app_commands.describe(oc_name="The name of the OC to permanently purge. Searches active and archived OCs.")
@@ -2074,7 +2160,16 @@ class PointsCog(commands.Cog):
         data["rank_snapshots"].append(snapshot)
         save_data(data, reason=f"points_{action.value}_{oc_name}", actor=interaction.user)
         
-        await interaction.response.send_message(embed=get_embed("Points Updated", f"OC **{oc['name']}** total points updated from {points_before:,} to {oc['total_points']:,}.", "success"))
+        await interaction.response.send_message(
+            embed=get_embed(
+                "Points Updated",
+                f"**{oc['name']}** · {action.value.capitalize()}: `{value:,}`\n"
+                f"Points: `{points_before:,}` → `{oc['total_points']:,}`\n"
+                f"New Rank: **#{oc['current_rank']}**",
+                "success"
+            ),
+            ephemeral=True
+        )
 
     @app_commands.command(name="resetallpoints", description="[DEV] Zero all OC points and anchor a new ranking baseline")
     @is_dev()
@@ -2903,6 +2998,7 @@ class RankingsCog(commands.Cog):
     @is_dev()
     async def private(self, interaction: discord.Interaction):
         data = load_data()
+        recalculate_ranks(data)
         
         voting_status_note = "🟢 Voting is **OPEN** — live tally shown." if data["voting"]["is_open"] else "🔴 Voting is **CLOSED**."
         
@@ -2942,14 +3038,6 @@ class RankingsCog(commands.Cog):
                 
             pages.append(embed)
             
-        snapshot = {
-            "timestamp": now().isoformat(),
-            "trigger": "RANKINGS_PRIVATE_COMMAND",
-            "rankings": [{"oc_id": o["id"], "rank": o["current_rank"], "points": o["total_points"]} for o in ocs]
-        }
-        data["rank_snapshots"].append(snapshot)
-        save_data(data, reason="rankings_private_snapshot", actor=interaction.user)
-        
         if len(pages) == 1:
             await interaction.response.send_message(embed=pages[0], ephemeral=True)
         else:
@@ -2983,6 +3071,7 @@ class RankingsCog(commands.Cog):
     @is_dev()
     async def partial(self, interaction: discord.Interaction, ranks: str):
         data = load_data()
+        recalculate_ranks(data)
         color = hex_to_int(data["config"]["reveal_color"])
         
         raw_tokens = re.split(r'[\s,]+', ranks.strip())
@@ -3029,7 +3118,7 @@ class RankingsCog(commands.Cog):
             )
             
         page_size = data["config"].get("reveal_page_size", 7)
-        page_embeds = await _run_sequential_reveal(channel, active_ocs, color, page_size, data, show_debut_line=False)
+        page_embeds = await _run_sequential_reveal(channel, active_ocs, color, page_size, data, show_debut_line=False, hide_points=True)
         
         await interaction.followup.send(
             embed=get_embed("📖 Browse Results", f"Scroll through all {len(page_embeds)} page(s).", "reveal", show_footer=True),
